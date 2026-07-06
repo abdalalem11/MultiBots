@@ -1,0 +1,6 @@
+# MultiBots runtime dependencies.
+# Pinned to compatible major versions for reproducible builds.
+Flask>=3.0,<4.0
+gunicorn>=22.0,<27.0
+psutil>=5.9,<8.0
+requests>=2.31,<3.0
