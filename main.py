@@ -1,116 +1,195 @@
+"""
+MultiBots — Git Source Downloader + Process Supervisor
+========================================================
+- Reads config.json
+- Clones each bot from "source" automatically
+- Updates existing Git repositories with git pull
+- Installs each bot requirements.txt automatically
+- Runs the configured Python entry file
+- Restarts crashed bots
+- Works with Render / Docker / VPS
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
 # ---------------------------------------------------------------------------
-# Repository manager — clone/update bot sources from config.json
+# Configuration
 # ---------------------------------------------------------------------------
 
-def _prepare_bot_source(cfg: BotConfig, bots_dir: str, log: logging.Logger) -> bool:
-    """
-    Clone the bot repository from cfg.source into:
-        <bots_dir>/<bot_name>
+VERSION = "3.0.0"
 
-    If the directory already contains a git repository, update it with
-    git pull instead of cloning again.
-    """
-    target_dir = Path(cfg.resolve_cwd(bots_dir))
-    git_dir = target_dir / ".git"
+BASE_DIR = Path(os.environ.get("MB_BASE_DIR", "/app"))
+CONFIG_PATH = Path(os.environ.get("MB_CONFIG_PATH", str(BASE_DIR / "config.json")))
 
-    try:
-        # Existing repository -> update it
-        if git_dir.is_dir():
-            log.info(
-                "Updating source for bot '%s' from %s",
-                cfg.name,
-                cfg.source,
+BOTS_DIR = Path(os.environ.get("MB_BOTS_DIR", str(BASE_DIR)))
+
+LOG_LEVEL = os.environ.get("MB_LOG_LEVEL", "INFO").upper()
+
+START_DELAY = float(os.environ.get("MB_START_DELAY", "2"))
+RESTART_DELAY = float(os.environ.get("MB_RESTART_DELAY", "5"))
+MAX_RESTARTS = int(os.environ.get("MB_MAX_RESTARTS", "10"))
+
+BOT_INSTALL_REQUIREMENTS = (
+    os.environ.get("MB_INSTALL_BOT_REQUIREMENTS", "true").lower()
+    in ("1", "true", "yes", "on")
+)
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+)
+
+LOG = logging.getLogger("multibots")
+
+
+# ---------------------------------------------------------------------------
+# Bot configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BotConfig:
+    name: str
+    source: str
+    run: str
+    env: Dict[str, str] = field(default_factory=dict)
+
+    enabled: bool = True
+    python: str = sys.executable
+    args: List[str] = field(default_factory=list)
+
+    max_restarts: Optional[int] = None
+    restart_delay: Optional[float] = None
+
+    cwd: Optional[str] = None
+
+    def bot_dir(self) -> Path:
+        if self.cwd:
+            path = Path(self.cwd)
+
+            if not path.is_absolute():
+                path = BOTS_DIR / path
+
+            return path
+
+        return BOTS_DIR / self.name
+
+    def run_file(self) -> Path:
+        return self.bot_dir() / self.run
+
+
+# ---------------------------------------------------------------------------
+# Config loader
+# ---------------------------------------------------------------------------
+
+class ConfigLoader:
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load(self) -> List[BotConfig]:
+
+        if not self.path.exists():
+            raise RuntimeError(
+                f"config.json not found: {self.path}"
             )
 
-            result = subprocess.run(
-                ["git", "-C", str(target_dir), "pull", "--ff-only"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=180,
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot read config.json: {exc}"
             )
 
-            if result.returncode != 0:
-                log.error(
-                    "Failed to update bot '%s': %s",
-                    cfg.name,
-                    result.stdout.strip(),
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "config.json must contain a JSON object"
+            )
+
+        bots = []
+
+        for name, raw in data.items():
+
+            if name.startswith("_"):
+                continue
+
+            if not isinstance(raw, dict):
+                LOG.error(
+                    "Skipping '%s': configuration must be an object",
+                    name,
                 )
-                return False
+                continue
 
-            log.info(
-                "Source for bot '%s' updated successfully.",
-                cfg.name,
-            )
-            return True
+            source = str(raw.get("source", "")).strip()
+            run = str(raw.get("run", "")).strip()
 
-        # Directory exists but isn't a git repository
-        if target_dir.exists() and any(target_dir.iterdir()):
-            log.warning(
-                "Bot directory '%s' exists but is not a git repository. "
-                "Removing it before clone.",
-                target_dir,
-            )
+            if not source:
+                LOG.error(
+                    "Skipping '%s': source is missing",
+                    name,
+                )
+                continue
 
-            import shutil
-            shutil.rmtree(target_dir)
+            if not run:
+                LOG.error(
+                    "Skipping '%s': run is missing",
+                    name,
+                )
+                continue
 
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
+            env = raw.get("env", {}) or {}
 
-        log.info(
-            "Cloning bot '%s' from %s -> %s",
-            cfg.name,
-            cfg.source,
-            target_dir,
-        )
+            if not isinstance(env, dict):
+                LOG.error(
+                    "Skipping '%s': env must be an object",
+                    name,
+                )
+                continue
 
-        result = subprocess.run(
-            [
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                cfg.source,
-                str(target_dir),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=300,
-        )
+            env = {
+                str(k): str(v)
+                for k, v in env.items()
+            }
 
-        if result.returncode != 0:
-            log.error(
-                "Failed to clone bot '%s': %s",
-                cfg.name,
-                result.stdout.strip(),
-            )
-            return False
-
-        log.info(
-            "Bot '%s' source downloaded successfully.",
-            cfg.name,
-        )
-        return True
-
-    except FileNotFoundError:
-        log.error(
-            "git command was not found. Make sure git is installed "
-            "in the Render environment."
-        )
-        return False
-
-    except subprocess.TimeoutExpired:
-        log.error(
-            "Timeout while downloading/updating bot '%s'.",
-            cfg.name,
-        )
-        return False
-
-    except Exception as exc:
-        log.exception(
-            "Unexpected error preparing bot '%s': %s",
-            cfg.name,
-            exc,
-        )
-        return False
+            bots.append(
+                BotConfig(
+                    name=name,
+                    source=source,
+                    run=run,
+                    env=env,
+                    enabled=bool(
+                        raw.get("enabled", True)
+                    ),
+                    python=str(
+                        raw.get("python", sys.executable)
+                    ),
+                    args=[
+                        str(x)
+                        for x in raw.get("args", [])
+                    ],
+                    max_restarts=(
+                        int(raw["max_restarts"])
+                        if raw.get("max_restarts") is not None
+                        else None
+                    ),
+                    restart_delay=(
+                        float(raw["restart_delay"])
+                        if raw.get("restart_delay") is not None
