@@ -2,10 +2,11 @@
 MultiBots - Multi-bot supervisor
 --------------------------------
 Downloads bot sources from config.json automatically,
-prints the downloaded bot tree, discovers the correct
-entry point, handles Python packages/relative imports,
-installs bot requirements when available, then starts
-and supervises each bot.
+prepares Python package structures, discovers the correct
+entry point, installs requirements, starts and supervises
+each bot.
+
+Version: 3.0.0
 """
 
 from __future__ import annotations
@@ -19,31 +20,74 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-__version__ = "2.4.0"
+__version__ = "3.0.0"
 
+
+# ============================================================
+# DEFAULT SETTINGS
+# ============================================================
 
 DEFAULTS: Dict[str, Any] = {
     "port": int(os.environ.get("MB_PORT", "10000")),
     "host": os.environ.get("MB_HOST", "0.0.0.0"),
-    "bots_dir": os.environ.get("MB_BOTS_DIR", "/tmp/bots"),
-    "config_path": os.environ.get("MB_CONFIG_PATH", "config.json"),
-    "log_level": os.environ.get("MB_LOG_LEVEL", "INFO"),
-    "start_delay": float(os.environ.get("MB_START_DELAY", "2")),
-    "max_restarts": int(os.environ.get("MB_MAX_RESTARTS", "5")),
+
+    "bots_dir": os.environ.get(
+        "MB_BOTS_DIR",
+        "/tmp/bots",
+    ),
+
+    "config_path": os.environ.get(
+        "MB_CONFIG_PATH",
+        "config.json",
+    ),
+
+    "log_level": os.environ.get(
+        "MB_LOG_LEVEL",
+        "INFO",
+    ),
+
+    "start_delay": float(
+        os.environ.get(
+            "MB_START_DELAY",
+            "2",
+        )
+    ),
+
+    "max_restarts": int(
+        os.environ.get(
+            "MB_MAX_RESTARTS",
+            "5",
+        )
+    ),
+
     "restart_delay_base": float(
-        os.environ.get("MB_RESTART_DELAY_BASE", "2")
+        os.environ.get(
+            "MB_RESTART_DELAY_BASE",
+            "2",
+        )
     ),
+
     "watchdog_interval": float(
-        os.environ.get("MB_WATCHDOG_INTERVAL", "10")
+        os.environ.get(
+            "MB_WATCHDOG_INTERVAL",
+            "10",
+        )
     ),
+
     "shutdown_timeout": float(
-        os.environ.get("MB_SHUTDOWN_TIMEOUT", "15")
+        os.environ.get(
+            "MB_SHUTDOWN_TIMEOUT",
+            "15",
+        )
     ),
+
     "install_requirements": os.environ.get(
         "MB_INSTALL_REQUIREMENTS",
         "true",
@@ -62,14 +106,17 @@ _RESERVED_KEYS = {
     "_global",
 }
 
+
 _BOT_NAME_RE = re.compile(
     r"^[A-Za-z][A-Za-z0-9_-]{0,63}$"
 )
+
 
 _REQUIRED_BOT_KEYS = {
     "source",
     "run",
 }
+
 
 _IGNORED_DIRS = {
     ".git",
@@ -81,7 +128,14 @@ _IGNORED_DIRS = {
 }
 
 
-def setup_logging(level: str = "INFO") -> logging.Logger:
+# ============================================================
+# LOGGING
+# ============================================================
+
+def setup_logging(
+    level: str = "INFO",
+) -> logging.Logger:
+
     logging.basicConfig(
         level=getattr(
             logging,
@@ -96,15 +150,22 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
         force=True,
     )
 
-    return logging.getLogger("multibots")
+    return logging.getLogger(
+        "multibots"
+    )
 
 
 class ConfigError(Exception):
     pass
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 @dataclass
 class BotConfig:
+
     name: str
     source: str
     run: str
@@ -136,7 +197,9 @@ class BotConfig:
 
         if self.cwd:
 
-            if os.path.isabs(self.cwd):
+            if os.path.isabs(
+                self.cwd
+            ):
                 return self.cwd
 
             return os.path.join(
@@ -155,10 +218,16 @@ class BotConfig:
     ) -> str:
 
         return os.path.join(
-            self.resolve_cwd(bots_dir),
+            self.resolve_cwd(
+                bots_dir
+            ),
             self.run,
         )
 
+
+# ============================================================
+# CONFIG LOADER
+# ============================================================
 
 class ConfigLoader:
 
@@ -200,7 +269,10 @@ class ConfigLoader:
                 f"Invalid JSON in {config_path}: {e}"
             ) from e
 
-        if isinstance(data, dict):
+        if isinstance(
+            data,
+            dict,
+        ):
 
             bots_data = data.get(
                 "bots",
@@ -211,27 +283,42 @@ class ConfigLoader:
 
             bots_data = data
 
-        if isinstance(bots_data, dict):
+        if isinstance(
+            bots_data,
+            dict,
+        ):
 
             items = []
 
-            for name, value in bots_data.items():
+            for name, value in (
+                bots_data.items()
+            ):
 
                 if name in _RESERVED_KEYS:
                     continue
 
-                if isinstance(value, dict):
+                if isinstance(
+                    value,
+                    dict,
+                ):
 
-                    value = dict(value)
+                    value = dict(
+                        value
+                    )
 
                     value.setdefault(
                         "name",
                         name,
                     )
 
-                    items.append(value)
+                    items.append(
+                        value
+                    )
 
-        elif isinstance(bots_data, list):
+        elif isinstance(
+            bots_data,
+            list,
+        ):
 
             items = bots_data
 
@@ -262,7 +349,9 @@ class ConfigLoader:
                 )
             ).strip()
 
-            if not _BOT_NAME_RE.match(name):
+            if not _BOT_NAME_RE.match(
+                name
+            ):
 
                 raise ConfigError(
                     f"Invalid bot name: {name!r}"
@@ -290,6 +379,7 @@ class ConfigLoader:
                 raw_env,
                 dict,
             ):
+
                 raise ConfigError(
                     f"Bot {name}: env must be an object"
                 )
@@ -303,6 +393,7 @@ class ConfigLoader:
                 raw_args,
                 list,
             ):
+
                 raise ConfigError(
                     f"Bot {name}: args must be a list"
                 )
@@ -321,7 +412,8 @@ class ConfigLoader:
 
                     env={
                         str(k): str(v)
-                        for k, v in raw_env.items()
+                        for k, v
+                        in raw_env.items()
                     },
 
                     enabled=bool(
@@ -331,12 +423,16 @@ class ConfigLoader:
                         )
                     ),
 
-                    max_restarts=item.get(
-                        "max_restarts"
+                    max_restarts=(
+                        item.get(
+                            "max_restarts"
+                        )
                     ),
 
-                    restart_delay_base=item.get(
-                        "restart_delay_base"
+                    restart_delay_base=(
+                        item.get(
+                            "restart_delay_base"
+                        )
                     ),
 
                     cwd=item.get(
@@ -359,6 +455,10 @@ class ConfigLoader:
 
         return bots
 
+
+# ============================================================
+# BOT SUPERVISOR
+# ============================================================
 
 class BotSupervisor:
 
@@ -383,21 +483,25 @@ class BotSupervisor:
             Tuple[str, str]
         ] = None
 
-    # ---------------------------------------------------------
-    # BASIC PATHS
-    # ---------------------------------------------------------
+
+    # ========================================================
+    # PATHS
+    # ========================================================
 
     def get_root(self) -> Path:
 
         return Path(
             self.config.resolve_cwd(
-                self.settings["bots_dir"]
+                self.settings[
+                    "bots_dir"
+                ]
             )
         )
 
-    # ---------------------------------------------------------
-    # PRINT BOT DIRECTORY
-    # ---------------------------------------------------------
+
+    # ========================================================
+    # TREE
+    # ========================================================
 
     def print_tree(self) -> None:
 
@@ -428,11 +532,13 @@ class BotSupervisor:
 
         try:
 
-            files = []
+            entries = []
 
             for path in root.rglob("*"):
 
-                relative = path.relative_to(root)
+                relative = path.relative_to(
+                    root
+                )
 
                 if any(
                     part in _IGNORED_DIRS
@@ -440,27 +546,29 @@ class BotSupervisor:
                 ):
                     continue
 
-                files.append(
+                entries.append(
                     (
                         str(relative),
                         path.is_dir(),
                     )
                 )
 
-            files.sort(
-                key=lambda item: (
-                    item[0].count(os.sep),
-                    item[0].lower(),
+            entries.sort(
+                key=lambda x: (
+                    x[0].count(
+                        os.sep
+                    ),
+                    x[0].lower(),
                 )
             )
 
-            if not files:
+            if not entries:
 
                 self.logger.info(
                     "Bot directory is empty."
                 )
 
-            for relative, is_dir in files:
+            for relative, is_dir in entries:
 
                 if is_dir:
 
@@ -486,9 +594,10 @@ class BotSupervisor:
             "=========================================="
         )
 
-    # ---------------------------------------------------------
+
+    # ========================================================
     # NORMALISE RUN
-    # ---------------------------------------------------------
+    # ========================================================
 
     def _normalise_run(self) -> str:
 
@@ -500,62 +609,39 @@ class BotSupervisor:
         )
 
         while run.startswith("./"):
+
             run = run[2:]
 
         return run
 
-    # ---------------------------------------------------------
-    # RELATIVE IMPORT DETECTION
-    # ---------------------------------------------------------
 
-    def _uses_relative_imports(
+    # ========================================================
+    # PYTHON FILE TEST
+    # ========================================================
+
+    def _is_python_file(
         self,
-        file: Path,
+        path: Path,
     ) -> bool:
 
-        if not file.is_file():
-            return False
-
-        try:
-
-            text = file.read_text(
-                encoding="utf-8",
-                errors="ignore",
-            )
-
-        except Exception:
-
-            return False
-
-        # Covers:
-        # from . import x
-        # from .. import x
-        # from .module import x
-        # from ..module import x
-        relative_import = re.search(
-            r"(?m)^\s*from\s+\.+",
-            text,
+        return (
+            path.is_file()
+            and path.suffix.lower()
+            == ".py"
         )
 
-        # Also detect explicit __package__ usage.
-        package_usage = (
-            "__package__"
-            in text
-        )
 
-        return bool(
-            relative_import
-            or package_usage
-        )
-
-    # ---------------------------------------------------------
-    # PACKAGE HELPERS
-    # ---------------------------------------------------------
+    # ========================================================
+    # ENSURE INIT
+    # ========================================================
 
     def _ensure_init_file(
         self,
         directory: Path,
     ) -> None:
+
+        if not directory.is_dir():
+            return
 
         init_file = (
             directory
@@ -586,26 +672,253 @@ class BotSupervisor:
 
             raise
 
-    def _ensure_package(
+
+    # ========================================================
+    # PREPARE ALL PACKAGES
+    # ========================================================
+
+    def prepare_python_packages(
         self,
-        root: Path,
     ) -> None:
 
         """
-        Makes the bot root importable as a Python package.
+        Automatically prepares Python package directories.
 
-        This is important for projects containing:
+        Example:
 
-            from . import *
-            from .config import ...
-            from .core import ...
+            bot1/
+                main.py
+                core/
+                    helper.py
 
-        without an existing root __init__.py.
+        becomes:
+
+            bot1/
+                __init__.py
+                main.py
+                core/
+                    __init__.py
+                    helper.py
+
+        This is especially useful for projects that were
+        downloaded without __init__.py files.
         """
 
-        self._ensure_init_file(root)
+        root = self.get_root()
 
-    def _package_module_name(
+        if not root.is_dir():
+            return
+
+        self.logger.info(
+            "Preparing Python package structure..."
+        )
+
+        # Root package
+        self._ensure_init_file(
+            root
+        )
+
+        # Every directory containing Python files
+        for directory in root.rglob("*"):
+
+            if not directory.is_dir():
+                continue
+
+            relative = directory.relative_to(
+                root
+            )
+
+            if any(
+                part in _IGNORED_DIRS
+                for part in relative.parts
+            ):
+                continue
+
+            has_python = any(
+                child.is_file()
+                and child.suffix.lower()
+                == ".py"
+                for child in directory.iterdir()
+            )
+
+            if has_python:
+
+                self._ensure_init_file(
+                    directory
+                )
+
+        self.logger.info(
+            "Python package preparation complete."
+        )
+
+
+    # ========================================================
+    # RELATIVE IMPORT DETECTION
+    # ========================================================
+
+    def _uses_relative_imports(
+        self,
+        file: Path,
+    ) -> bool:
+
+        if not file.is_file():
+            return False
+
+        try:
+
+            text = file.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
+
+        except Exception:
+
+            return False
+
+        relative_import = re.search(
+            r"(?m)^\s*from\s+\.+",
+            text,
+        )
+
+        package_usage = (
+            "__package__"
+            in text
+        )
+
+        return bool(
+            relative_import
+            or package_usage
+        )
+
+
+    # ========================================================
+    # FIND CASE-INSENSITIVE PATH
+    # ========================================================
+
+    def _find_case_insensitive(
+        self,
+        base: Path,
+        parts: List[str],
+    ) -> Optional[Path]:
+
+        current = base
+
+        for part in parts:
+
+            if not current.is_dir():
+                return None
+
+            exact = (
+                current / part
+            )
+
+            if exact.exists():
+
+                current = exact
+                continue
+
+            wanted = part.lower()
+
+            matches = []
+
+            try:
+
+                for child in current.iterdir():
+
+                    if (
+                        child.name.lower()
+                        == wanted
+                    ):
+
+                        matches.append(
+                            child
+                        )
+
+            except OSError:
+
+                return None
+
+            if len(matches) == 1:
+
+                current = matches[0]
+
+            elif len(matches) > 1:
+
+                # Ambiguous names on Linux.
+                self.logger.warning(
+                    "Multiple case-insensitive "
+                    "matches for %s under %s",
+                    part,
+                    current,
+                )
+
+                return None
+
+            else:
+
+                return None
+
+        return current
+
+
+    # ========================================================
+    # RESOLVE REQUESTED FILE
+    # ========================================================
+
+    def _resolve_requested_file(
+        self,
+        root: Path,
+        requested: str,
+    ) -> Optional[Path]:
+
+        requested = requested.replace(
+            "\\",
+            "/",
+        ).strip("/")
+
+        parts = [
+            p
+            for p in requested.split("/")
+            if p
+        ]
+
+        if not parts:
+            return None
+
+        exact = root.joinpath(
+            *parts
+        )
+
+        if exact.is_file():
+            return exact
+
+        # Try case-insensitive lookup.
+        found = self._find_case_insensitive(
+            root,
+            parts,
+        )
+
+        if found and found.is_file():
+
+            if str(found) != str(exact):
+
+                self.logger.warning(
+                    "Case-insensitive path match: "
+                    "%s -> %s",
+                    requested,
+                    found,
+                )
+
+            return found
+
+        return None
+
+
+    # ========================================================
+    # MODULE NAME
+    # ========================================================
+
+    def _module_name_from_file(
         self,
         root: Path,
         file: Path,
@@ -613,13 +926,15 @@ class BotSupervisor:
 
         try:
 
-            relative = file.relative_to(root)
+            relative = file.relative_to(
+                root
+            )
 
         except ValueError:
 
             return None
 
-        if relative.suffix != ".py":
+        if relative.suffix.lower() != ".py":
             return None
 
         parts = list(
@@ -629,27 +944,31 @@ class BotSupervisor:
         if not parts:
             return None
 
-        module_parts = [
-            root.name,
-            *parts,
-        ]
-
         return ".".join(
-            module_parts
+            [
+                root.name,
+                *parts,
+            ]
         )
 
-    def _prepare_package(
+
+    # ========================================================
+    # PREPARE MODULE PACKAGE
+    # ========================================================
+
+    def _prepare_package_for_file(
         self,
         root: Path,
         file: Path,
     ) -> str:
 
-        self._ensure_package(
+        self._ensure_init_file(
             root
         )
 
-        # Make nested Python directories packages.
-        relative = file.relative_to(root)
+        relative = file.relative_to(
+            root
+        )
 
         current = root
 
@@ -665,125 +984,108 @@ class BotSupervisor:
                     current
                 )
 
-        module = self._package_module_name(
-            root,
-            file,
+        module = (
+            self._module_name_from_file(
+                root,
+                file,
+            )
         )
 
         if not module:
 
             raise RuntimeError(
-                f"Could not create module name for {file}"
+                f"Unable to create module name "
+                f"for {file}"
             )
 
         return module
 
-    # ---------------------------------------------------------
-    # ENTRY POINT DISCOVERY
-    # ---------------------------------------------------------
 
-    def _module_from_file(
+    # ========================================================
+    # MODULE IMPORT CHECK
+    # ========================================================
+
+    def _module_exists(
         self,
         root: Path,
-        file: Path,
-    ) -> Optional[str]:
+        module: str,
+    ) -> bool:
 
-        try:
-
-            relative = file.relative_to(root)
-
-        except ValueError:
-
-            return None
-
-        if relative.suffix != ".py":
-            return None
-
-        parts = list(
-            relative.with_suffix("").parts
-        )
+        parts = module.split(".")
 
         if not parts:
-            return None
+            return False
 
-        if len(parts) == 1:
-            return None
+        # Remove bot package name.
+        if parts[0] == root.name:
+
+            parts = parts[1:]
 
         current = root
 
-        for part in parts[:-1]:
+        for index, part in enumerate(
+            parts
+        ):
+
+            if index == len(parts) - 1:
+
+                py_file = (
+                    current
+                    / f"{part}.py"
+                )
+
+                package_dir = (
+                    current / part
+                )
+
+                if (
+                    py_file.is_file()
+                    or package_dir.is_dir()
+                ):
+
+                    return True
+
+                # Case insensitive.
+                if self._find_case_insensitive(
+                    current,
+                    [f"{part}.py"],
+                ):
+
+                    return True
+
+                if self._find_case_insensitive(
+                    current,
+                    [part],
+                ):
+
+                    return True
+
+                return False
 
             current = (
                 current / part
             )
 
-            if not (
-                current.is_dir()
-                and (
-                    current / "__init__.py"
-                ).is_file()
-            ):
+            if not current.is_dir():
 
-                return None
-
-        return ".".join(parts)
-
-    def _find_package_main(
-        self,
-        root: Path,
-    ) -> Optional[Tuple[str, str]]:
-
-        candidates = []
-
-        try:
-
-            for file in root.rglob("main.py"):
-
-                relative = file.relative_to(root)
-
-                if any(
-                    part in _IGNORED_DIRS
-                    for part in relative.parts
-                ):
-                    continue
-
-                module = self._module_from_file(
-                    root,
-                    file,
+                found = (
+                    self._find_case_insensitive(
+                        current.parent,
+                        [part],
+                    )
                 )
 
-                if module:
+                if found is None:
+                    return False
 
-                    candidates.append(
-                        (
-                            str(file),
-                            module,
-                        )
-                    )
+                current = found
 
-        except Exception:
+        return True
 
-            self.logger.exception(
-                "Error while searching package main"
-            )
 
-        candidates.sort(
-            key=lambda item: (
-                item[0].count(os.sep),
-                item[0].lower(),
-            )
-        )
-
-        if candidates:
-
-            file, module = candidates[0]
-
-            return (
-                "module",
-                module,
-            )
-
-        return None
+    # ========================================================
+    # DISCOVER ENTRY POINT
+    # ========================================================
 
     def discover_entrypoint(
         self,
@@ -791,28 +1093,38 @@ class BotSupervisor:
 
         root = self.get_root()
 
-        requested = self._normalise_run()
+        requested = (
+            self._normalise_run()
+        )
 
         self.logger.info(
             "Requested run entry: %s",
             requested,
         )
 
-        # -----------------------------------------------------
-        # 1. Exact file
-        # -----------------------------------------------------
+        # Make package structure ready first.
+        self.prepare_python_packages()
 
-        exact = root / requested
+        # ----------------------------------------------------
+        # 1. Exact requested file
+        # ----------------------------------------------------
 
-        if exact.is_file():
+        exact = self._resolve_requested_file(
+            root,
+            requested,
+        )
+
+        if exact:
 
             if self._uses_relative_imports(
                 exact
             ):
 
-                module = self._prepare_package(
-                    root,
-                    exact,
+                module = (
+                    self._prepare_package_for_file(
+                        root,
+                        exact,
+                    )
                 )
 
                 self.logger.info(
@@ -839,25 +1151,32 @@ class BotSupervisor:
                 str(exact),
             )
 
-        # -----------------------------------------------------
-        # 2. Add .py automatically
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # 2. Add .py
+        # ----------------------------------------------------
 
-        if not requested.endswith(".py"):
+        if not requested.lower().endswith(
+            ".py"
+        ):
 
-            py_file = root / (
-                requested + ".py"
+            py_file = (
+                self._resolve_requested_file(
+                    root,
+                    requested + ".py",
+                )
             )
 
-            if py_file.is_file():
+            if py_file:
 
                 if self._uses_relative_imports(
                     py_file
                 ):
 
-                    module = self._prepare_package(
-                        root,
-                        py_file,
+                    module = (
+                        self._prepare_package_for_file(
+                            root,
+                            py_file,
+                        )
                     )
 
                     self.logger.info(
@@ -865,7 +1184,8 @@ class BotSupervisor:
                     )
 
                     self.logger.info(
-                        "Entry point selected: module -> %s",
+                        "Entry point selected: "
+                        "module -> %s",
                         module,
                     )
 
@@ -873,87 +1193,83 @@ class BotSupervisor:
                         "module",
                         module,
                     )
-
-                self.logger.info(
-                    "Entry point selected: file -> %s",
-                    py_file,
-                )
 
                 return (
                     "file",
                     str(py_file),
                 )
 
-        # -----------------------------------------------------
-        # 3. Explicit package/module request
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # 3. Explicit module
+        # ----------------------------------------------------
 
-        package_request = requested.replace(
-            "/",
-            ".",
+        package_request = (
+            requested
+            .replace("/", ".")
         )
 
-        if package_request.endswith(".py"):
+        if package_request.endswith(
+            ".py"
+        ):
 
-            package_request = package_request[
-                :-3
-            ]
-
-        module_file = root / (
-            package_request.replace(
-                ".",
-                os.sep,
+            package_request = (
+                package_request[:-3]
             )
-            + ".py"
+
+        module_parts = (
+            package_request.split(".")
         )
 
-        if module_file.is_file():
+        if (
+            module_parts
+            and module_parts[0]
+            == root.name
+        ):
 
             module_parts = (
-                package_request.split(".")
+                module_parts[1:]
             )
 
-            if len(module_parts) > 1:
+        if module_parts:
 
-                package_root = root
+            module_path = (
+                root.joinpath(
+                    *module_parts
+                )
+            )
 
-                valid_package = True
+            module_file = Path(
+                str(module_path)
+                + ".py"
+            )
 
-                for part in module_parts[:-1]:
+            if module_file.is_file():
 
-                    package_root = (
-                        package_root / part
-                    )
+                module = ".".join(
+                    [
+                        root.name,
+                        *module_parts,
+                    ]
+                )
 
-                    if not (
-                        package_root.is_dir()
-                        and (
-                            package_root
-                            / "__init__.py"
-                        ).is_file()
-                    ):
+                self.logger.info(
+                    "Entry point selected: "
+                    "module -> %s",
+                    module,
+                )
 
-                        valid_package = False
-                        break
+                return (
+                    "module",
+                    module,
+                )
 
-                if valid_package:
-
-                    self.logger.info(
-                        "Entry point selected: "
-                        "module -> %s",
-                        package_request,
-                    )
-
-                    return (
-                        "module",
-                        package_request,
-                    )
-
-        # -----------------------------------------------------
+        # ----------------------------------------------------
         # 4. Root main.py
-        # -----------------------------------------------------
+        # ----------------------------------------------------
 
-        root_main = root / "main.py"
+        root_main = (
+            root / "main.py"
+        )
 
         if root_main.is_file():
 
@@ -961,9 +1277,11 @@ class BotSupervisor:
                 root_main
             ):
 
-                module = self._prepare_package(
-                    root,
-                    root_main,
+                module = (
+                    self._prepare_package_for_file(
+                        root,
+                        root_main,
+                    )
                 )
 
                 self.logger.info(
@@ -981,7 +1299,6 @@ class BotSupervisor:
                 )
 
             self.logger.info(
-                "Requested entry not found. "
                 "Automatically selected root main.py: %s",
                 root_main,
             )
@@ -991,9 +1308,9 @@ class BotSupervisor:
                 str(root_main),
             )
 
-        # -----------------------------------------------------
-        # 5. Common entry files
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # 5. Common files
+        # ----------------------------------------------------
 
         for filename in (
             "app.py",
@@ -1003,26 +1320,24 @@ class BotSupervisor:
             "server.py",
         ):
 
-            candidate = root / filename
+            candidate = (
+                self._resolve_requested_file(
+                    root,
+                    filename,
+                )
+            )
 
-            if candidate.is_file():
+            if candidate:
 
                 if self._uses_relative_imports(
                     candidate
                 ):
 
-                    module = self._prepare_package(
-                        root,
-                        candidate,
-                    )
-
-                    self.logger.info(
-                        "Relative imports detected."
-                    )
-
-                    self.logger.info(
-                        "Automatically selected module: %s",
-                        module,
+                    module = (
+                        self._prepare_package_for_file(
+                            root,
+                            candidate,
+                        )
                     )
 
                     return (
@@ -1030,36 +1345,69 @@ class BotSupervisor:
                         module,
                     )
 
-                self.logger.info(
-                    "Automatically selected entry point: %s",
-                    candidate,
-                )
-
                 return (
                     "file",
                     str(candidate),
                 )
 
-        # -----------------------------------------------------
-        # 6. Search package/main.py
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # 6. Search main.py recursively
+        # ----------------------------------------------------
 
-        package_main = self._find_package_main(
-            root
+        candidates = []
+
+        for file in root.rglob(
+            "main.py"
+        ):
+
+            relative = file.relative_to(
+                root
+            )
+
+            if any(
+                part in _IGNORED_DIRS
+                for part in relative.parts
+            ):
+                continue
+
+            module = (
+                self._module_name_from_file(
+                    root,
+                    file,
+                )
+            )
+
+            if module:
+
+                candidates.append(
+                    (
+                        file,
+                        module,
+                    )
+                )
+
+        candidates.sort(
+            key=lambda x: (
+                len(x[0].relative_to(root).parts),
+                str(x[0]).lower(),
+            )
         )
 
-        if package_main:
+        if candidates:
 
-            mode, value = package_main
+            file, module = (
+                candidates[0]
+            )
 
             self.logger.info(
-                "Automatically selected package entry: %s",
-                value,
+                "Automatically selected "
+                "package entry: %s",
+                module,
             )
 
             return (
-                mode,
-                value,
+                "module",
+                module,
             )
 
         raise FileNotFoundError(
@@ -1068,11 +1416,14 @@ class BotSupervisor:
             f"root={root}"
         )
 
-    # ---------------------------------------------------------
-    # DOWNLOAD
-    # ---------------------------------------------------------
 
-    def download_source(self) -> None:
+    # ========================================================
+    # SOURCE DOWNLOAD
+    # ========================================================
+
+    def download_source(
+        self,
+    ) -> None:
 
         target = self.get_root()
 
@@ -1081,7 +1432,9 @@ class BotSupervisor:
             exist_ok=True,
         )
 
-        source = self.config.source
+        source = (
+            self.config.source
+        )
 
         if source.startswith(
             (
@@ -1092,7 +1445,14 @@ class BotSupervisor:
 
             if target.exists():
 
-                shutil.rmtree(target)
+                self.logger.info(
+                    "Removing old bot directory: %s",
+                    target,
+                )
+
+                shutil.rmtree(
+                    target
+                )
 
             self.logger.info(
                 "Cloning %s...",
@@ -1113,7 +1473,9 @@ class BotSupervisor:
 
         else:
 
-            src = Path(source)
+            src = Path(
+                source
+            )
 
             if not src.exists():
 
@@ -1123,7 +1485,9 @@ class BotSupervisor:
 
             if target.exists():
 
-                shutil.rmtree(target)
+                shutil.rmtree(
+                    target
+                )
 
             shutil.copytree(
                 src,
@@ -1132,9 +1496,10 @@ class BotSupervisor:
 
         self.print_tree()
 
-    # ---------------------------------------------------------
+
+    # ========================================================
     # REQUIREMENTS
-    # ---------------------------------------------------------
+    # ========================================================
 
     def install_requirements(
         self,
@@ -1144,6 +1509,11 @@ class BotSupervisor:
             "install_requirements",
             True,
         ):
+
+            self.logger.info(
+                "Requirement installation disabled."
+            )
+
             return
 
         root = self.get_root()
@@ -1155,7 +1525,7 @@ class BotSupervisor:
         if not requirements.is_file():
 
             self.logger.info(
-                "No bot requirements.txt found for %s",
+                "No requirements.txt found for %s",
                 self.config.name,
             )
 
@@ -1183,31 +1553,93 @@ class BotSupervisor:
             ),
         )
 
-        try:
+        subprocess.run(
+            command,
+            cwd=str(root),
+            check=True,
+        )
 
-            subprocess.run(
-                command,
-                cwd=str(root),
-                check=True,
-            )
+        self.logger.info(
+            "Requirements installed for %s",
+            self.config.name,
+        )
 
-            self.logger.info(
-                "Requirements installed for %s",
-                self.config.name,
-            )
 
-        except subprocess.CalledProcessError:
+    # ========================================================
+    # BUILD ENVIRONMENT
+    # ========================================================
 
-            self.logger.exception(
-                "Failed to install requirements for %s",
-                self.config.name,
-            )
+    def build_environment(
+        self,
+        cwd: Path,
+    ) -> Dict[str, str]:
 
-            raise
+        env = os.environ.copy()
 
-    # ---------------------------------------------------------
+        env.update(
+            self.config.env
+        )
+
+        bots_dir = str(
+            Path(
+                self.settings[
+                    "bots_dir"
+                ]
+            ).resolve()
+        )
+
+        bot_dir = str(
+            cwd.resolve()
+        )
+
+        existing = env.get(
+            "PYTHONPATH",
+            "",
+        )
+
+        paths = []
+
+        # Order is important.
+        for path in (
+            bot_dir,
+            bots_dir,
+            existing,
+        ):
+
+            if not path:
+                continue
+
+            for item in path.split(
+                os.pathsep
+            ):
+
+                if (
+                    item
+                    and item not in paths
+                ):
+
+                    paths.append(
+                        item
+                    )
+
+        env[
+            "PYTHONPATH"
+        ] = os.pathsep.join(
+            paths
+        )
+
+        # Helpful Python flags.
+        env.setdefault(
+            "PYTHONUNBUFFERED",
+            "1",
+        )
+
+        return env
+
+
+    # ========================================================
     # START
-    # ---------------------------------------------------------
+    # ========================================================
 
     def start(self) -> None:
 
@@ -1223,62 +1655,9 @@ class BotSupervisor:
             self.discover_entrypoint()
         )
 
-        env = os.environ.copy()
-
-        env.update(
-            self.config.env
+        env = self.build_environment(
+            cwd
         )
-
-        # -----------------------------------------------------
-        # IMPORTANT:
-        #
-        # When using "python -m bot1.main", Python needs
-        # /tmp/bots on sys.path, not /tmp/bots/bot1.
-        # -----------------------------------------------------
-
-        pythonpath = env.get(
-            "PYTHONPATH",
-            "",
-        )
-
-        bots_dir = str(
-            Path(
-                self.settings["bots_dir"]
-            ).resolve()
-        )
-
-        if pythonpath:
-
-            paths = pythonpath.split(
-                os.pathsep
-            )
-
-            if bots_dir not in paths:
-
-                env["PYTHONPATH"] = (
-                    bots_dir
-                    + os.pathsep
-                    + pythonpath
-                )
-
-        else:
-
-            env["PYTHONPATH"] = bots_dir
-
-        # Also expose the bot directory itself.
-        bot_path = str(
-            cwd.resolve()
-        )
-
-        if bot_path not in env[
-            "PYTHONPATH"
-        ].split(os.pathsep):
-
-            env["PYTHONPATH"] = (
-                bot_path
-                + os.pathsep
-                + env["PYTHONPATH"]
-            )
 
         if mode == "file":
 
@@ -1342,6 +1721,7 @@ class BotSupervisor:
             command,
             cwd=str(cwd),
             env=env,
+            stdin=subprocess.DEVNULL,
         )
 
         self.logger.info(
@@ -1350,15 +1730,18 @@ class BotSupervisor:
             self.process.pid,
         )
 
-    # ---------------------------------------------------------
+
+    # ========================================================
     # STOP
-    # ---------------------------------------------------------
+    # ========================================================
 
     def stop(self) -> None:
 
+        process = self.process
+
         if (
-            self.process
-            and self.process.poll() is None
+            process
+            and process.poll() is None
         ):
 
             self.logger.info(
@@ -1368,12 +1751,14 @@ class BotSupervisor:
 
             try:
 
-                self.process.terminate()
+                process.terminate()
 
-                self.process.wait(
-                    timeout=self.settings[
-                        "shutdown_timeout"
-                    ]
+                process.wait(
+                    timeout=float(
+                        self.settings[
+                            "shutdown_timeout"
+                        ]
+                    )
                 )
 
             except subprocess.TimeoutExpired:
@@ -1383,11 +1768,11 @@ class BotSupervisor:
                     self.config.name,
                 )
 
-                self.process.kill()
+                process.kill()
 
                 try:
 
-                    self.process.wait(
+                    process.wait(
                         timeout=5
                     )
 
@@ -1401,6 +1786,87 @@ class BotSupervisor:
                     self.config.name,
                 )
 
+
+    # ========================================================
+    # ERROR DIAGNOSTICS
+    # ========================================================
+
+    def diagnose_import_error(
+        self,
+    ) -> None:
+
+        """
+        Gives a useful diagnostic when Python reports a
+        missing module.
+
+        It does not create fake application modules because
+        doing so can silently corrupt the bot's behaviour.
+        """
+
+        root = self.get_root()
+
+        self.logger.error(
+            "Bot %s failed during Python import.",
+            self.config.name,
+        )
+
+        self.logger.error(
+            "Bot root: %s",
+            root,
+        )
+
+        if not root.exists():
+
+            self.logger.error(
+                "Bot root no longer exists."
+            )
+
+            return
+
+        # Search common package names.
+        interesting = []
+
+        for path in root.rglob("*"):
+
+            if not path.is_file():
+                continue
+
+            if path.suffix.lower() in {
+                ".py",
+            }:
+
+                interesting.append(
+                    str(
+                        path.relative_to(
+                            root
+                        )
+                    )
+                )
+
+        interesting.sort()
+
+        self.logger.error(
+            "Python files currently available:"
+        )
+
+        for item in interesting[:200]:
+
+            self.logger.error(
+                "  %s",
+                item,
+            )
+
+        if len(interesting) > 200:
+
+            self.logger.error(
+                "  ... and %s more",
+                len(interesting) - 200,
+            )
+
+
+# ============================================================
+# MULTIBOTS
+# ============================================================
 
 class MultiBots:
 
@@ -1422,7 +1888,9 @@ class MultiBots:
             )
 
         self.logger = setup_logging(
-            self.settings["log_level"]
+            self.settings[
+                "log_level"
+            ]
         )
 
         self.supervisors: List[
@@ -1430,6 +1898,11 @@ class MultiBots:
         ] = []
 
         self.running = True
+
+
+    # ========================================================
+    # RUN
+    # ========================================================
 
     def run(self) -> None:
 
@@ -1472,30 +1945,43 @@ class MultiBots:
 
             try:
 
-                # -------------------------------------------------
-                # Download source
-                # -------------------------------------------------
+                # -------------------------------
+                # Download
+                # -------------------------------
 
                 supervisor.download_source()
 
-                # -------------------------------------------------
-                # Install bot dependencies
-                # -------------------------------------------------
+                # -------------------------------
+                # Prepare packages
+                # -------------------------------
+
+                supervisor.prepare_python_packages()
+
+                # -------------------------------
+                # Requirements
+                # -------------------------------
 
                 supervisor.install_requirements()
 
-                # -------------------------------------------------
-                # Start bot
-                # -------------------------------------------------
+                # -------------------------------
+                # Start
+                # -------------------------------
 
                 supervisor.start()
 
-            except Exception:
+            except Exception as exc:
 
-                self.logger.exception(
-                    "Failed to start %s",
+                self.logger.error(
+                    "Failed to start %s: %s",
                     config.name,
+                    exc,
                 )
+
+                self.logger.error(
+                    traceback.format_exc()
+                )
+
+                supervisor.diagnose_import_error()
 
                 continue
 
@@ -1504,99 +1990,127 @@ class MultiBots:
             )
 
             time.sleep(
-                self.settings[
-                    "start_delay"
-                ]
+                float(
+                    self.settings[
+                        "start_delay"
+                    ]
+                )
             )
+
+        # ====================================================
+        # WATCHDOG
+        # ====================================================
 
         while self.running:
 
-            for supervisor in self.supervisors:
+            for supervisor in (
+                self.supervisors
+            ):
 
                 if not self.running:
                     break
 
-                proc = supervisor.process
+                process = (
+                    supervisor.process
+                )
 
                 if (
-                    proc
-                    and proc.poll() is not None
+                    process is None
+                    or process.poll() is None
+                ):
+                    continue
+
+                return_code = (
+                    process.returncode
+                )
+
+                self.logger.warning(
+                    "%s exited with return code %s",
+                    supervisor.config.name,
+                    return_code,
+                )
+
+                limit = (
+                    supervisor.config.max_restarts
+                )
+
+                if limit is None:
+
+                    limit = self.settings[
+                        "max_restarts"
+                    ]
+
+                if (
+                    supervisor.restarts
+                    < int(limit)
                 ):
 
-                    return_code = proc.returncode
+                    supervisor.restarts += 1
 
-                    self.logger.warning(
-                        "%s exited with return code %s",
-                        supervisor.config.name,
-                        return_code,
+                    delay = (
+                        supervisor.config
+                        .restart_delay_base
                     )
 
-                    limit = (
-                        supervisor.config.max_restarts
-                    )
+                    if delay is None:
 
-                    if limit is None:
-
-                        limit = self.settings[
-                            "max_restarts"
+                        delay = self.settings[
+                            "restart_delay_base"
                         ]
 
-                    if supervisor.restarts < int(
-                        limit
-                    ):
+                    self.logger.warning(
+                        "Restarting %s "
+                        "(attempt %s/%s)",
+                        supervisor.config.name,
+                        supervisor.restarts,
+                        limit,
+                    )
 
-                        supervisor.restarts += 1
+                    time.sleep(
+                        float(delay)
+                    )
 
-                        delay = (
-                            supervisor.config
-                            .restart_delay_base
-                        )
+                    if not self.running:
+                        break
 
-                        if delay is None:
+                    try:
 
-                            delay = self.settings[
-                                "restart_delay_base"
-                            ]
+                        supervisor.start()
 
-                        self.logger.warning(
-                            "Restarting %s "
-                            "(attempt %s/%s)",
-                            supervisor.config.name,
-                            supervisor.restarts,
-                            limit,
-                        )
-
-                        time.sleep(
-                            float(delay)
-                        )
-
-                        if not self.running:
-                            break
-
-                        try:
-
-                            supervisor.start()
-
-                        except Exception:
-
-                            self.logger.exception(
-                                "Failed to restart %s",
-                                supervisor.config.name,
-                            )
-
-                    else:
+                    except Exception as exc:
 
                         self.logger.error(
-                            "Restart limit reached "
-                            "for %s",
+                            "Failed to restart %s: %s",
                             supervisor.config.name,
+                            exc,
                         )
 
+                        self.logger.error(
+                            traceback.format_exc()
+                        )
+
+                        supervisor.diagnose_import_error()
+
+                else:
+
+                    self.logger.error(
+                        "Restart limit reached "
+                        "for %s",
+                        supervisor.config.name,
+                    )
+
             time.sleep(
-                self.settings[
-                    "watchdog_interval"
-                ]
+                float(
+                    self.settings[
+                        "watchdog_interval"
+                    ]
+                )
             )
+
+
+    # ========================================================
+    # SHUTDOWN
+    # ========================================================
 
     def shutdown(self) -> None:
 
@@ -1609,7 +2123,9 @@ class MultiBots:
             "Shutting down MultiBots..."
         )
 
-        for supervisor in self.supervisors:
+        for supervisor in (
+            self.supervisors
+        ):
 
             supervisor.stop()
 
@@ -1617,6 +2133,10 @@ class MultiBots:
             "MultiBots shutdown complete."
         )
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main() -> None:
 
@@ -1646,6 +2166,14 @@ def main() -> None:
         app.run()
 
     except KeyboardInterrupt:
+
+        app.shutdown()
+
+    except Exception:
+
+        app.logger.exception(
+            "Fatal MultiBots error"
+        )
 
         app.shutdown()
 
