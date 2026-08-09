@@ -1,8 +1,9 @@
 """
 MultiBots - Multi-bot supervisor
-
+---------------------------------
 Downloads bot sources from config.json automatically,
-then starts and supervises each bot.
+prints the downloaded bot tree, discovers the correct
+entry point, then starts and supervises each bot.
 """
 
 from __future__ import annotations
@@ -18,10 +19,10 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
-__version__ = "2.2.2"
+__version__ = "2.3.0"
 
 
 DEFAULTS: Dict[str, Any] = {
@@ -52,6 +53,15 @@ _BOT_NAME_RE = re.compile(
 
 _REQUIRED_BOT_KEYS = {"source", "run"}
 
+_IGNORED_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "env",
+    "node_modules",
+}
+
 
 def setup_logging(level: str = "INFO") -> logging.Logger:
     logging.basicConfig(
@@ -81,7 +91,9 @@ class BotConfig:
     source: str
     run: str
 
-    env: Dict[str, str] = field(default_factory=dict)
+    env: Dict[str, str] = field(
+        default_factory=dict
+    )
 
     enabled: bool = True
 
@@ -99,8 +111,13 @@ class BotConfig:
         default_factory=list
     )
 
-    def resolve_cwd(self, bots_dir: str) -> str:
+    def resolve_cwd(
+        self,
+        bots_dir: str,
+    ) -> str:
+
         if self.cwd:
+
             if os.path.isabs(self.cwd):
                 return self.cwd
 
@@ -114,7 +131,11 @@ class BotConfig:
             self.name,
         )
 
-    def resolve_runfile(self, bots_dir: str) -> str:
+    def resolve_runfile(
+        self,
+        bots_dir: str,
+    ) -> str:
+
         return os.path.join(
             self.resolve_cwd(bots_dir),
             self.run,
@@ -139,29 +160,36 @@ class ConfigLoader:
         )
 
         try:
+
             with open(
                 config_path,
                 "r",
                 encoding="utf-8",
             ) as f:
+
                 data = json.load(f)
 
         except FileNotFoundError as e:
+
             raise ConfigError(
                 f"Config file not found: {config_path}"
             ) from e
 
         except json.JSONDecodeError as e:
+
             raise ConfigError(
                 f"Invalid JSON in {config_path}: {e}"
             ) from e
 
         if isinstance(data, dict):
+
             bots_data = data.get(
                 "bots",
                 data,
             )
+
         else:
+
             bots_data = data
 
         if isinstance(bots_data, dict):
@@ -189,6 +217,7 @@ class ConfigLoader:
             items = bots_data
 
         else:
+
             raise ConfigError(
                 "config.json must contain "
                 "a list of bots or a bots object"
@@ -202,6 +231,7 @@ class ConfigLoader:
                 item,
                 dict,
             ):
+
                 raise ConfigError(
                     "Each bot must be an object"
                 )
@@ -214,6 +244,7 @@ class ConfigLoader:
             ).strip()
 
             if not _BOT_NAME_RE.match(name):
+
                 raise ConfigError(
                     f"Invalid bot name: {name!r}"
                 )
@@ -225,6 +256,7 @@ class ConfigLoader:
             ]
 
             if missing:
+
                 raise ConfigError(
                     f"Bot {name}: missing "
                     f"{', '.join(missing)}"
@@ -292,6 +324,7 @@ class ConfigLoader:
 
 
 class BotSupervisor:
+
     def __init__(
         self,
         config: BotConfig,
@@ -308,6 +341,427 @@ class BotSupervisor:
         ] = None
 
         self.restarts = 0
+
+        self.entrypoint: Optional[
+            Tuple[str, str]
+        ] = None
+
+    # ---------------------------------------------------------
+    # PRINT BOT DIRECTORY
+    # ---------------------------------------------------------
+
+    def print_tree(self) -> None:
+
+        root = Path(
+            self.config.resolve_cwd(
+                self.settings["bots_dir"]
+            )
+        )
+
+        self.logger.info(
+            "========== BOT CONTENTS: %s ==========",
+            root,
+        )
+
+        if not root.exists():
+
+            self.logger.warning(
+                "Bot directory does not exist: %s",
+                root,
+            )
+
+            return
+
+        if not root.is_dir():
+
+            self.logger.warning(
+                "Bot path is not a directory: %s",
+                root,
+            )
+
+            return
+
+        try:
+
+            files = []
+
+            for path in root.rglob("*"):
+
+                relative = path.relative_to(root)
+
+                if any(
+                    part in _IGNORED_DIRS
+                    for part in relative.parts
+                ):
+                    continue
+
+                files.append(
+                    (
+                        str(relative),
+                        path.is_dir(),
+                    )
+                )
+
+            files.sort(
+                key=lambda item: (
+                    item[0].count(os.sep),
+                    item[0].lower(),
+                )
+            )
+
+            if not files:
+
+                self.logger.info(
+                    "Bot directory is empty."
+                )
+
+            for relative, is_dir in files:
+
+                if is_dir:
+
+                    self.logger.info(
+                        "  [DIR ] %s/",
+                        relative,
+                    )
+
+                else:
+
+                    self.logger.info(
+                        "  [FILE] %s",
+                        relative,
+                    )
+
+        except Exception:
+
+            self.logger.exception(
+                "Failed to print bot contents"
+            )
+
+        self.logger.info(
+            "=========================================="
+        )
+
+    # ---------------------------------------------------------
+    # ENTRY POINT DISCOVERY
+    # ---------------------------------------------------------
+
+    def _normalise_run(self) -> str:
+
+        run = self.config.run.strip()
+
+        run = run.replace(
+            "\\",
+            "/",
+        )
+
+        while run.startswith("./"):
+            run = run[2:]
+
+        return run
+
+    def _module_from_file(
+        self,
+        root: Path,
+        file: Path,
+    ) -> Optional[str]:
+
+        try:
+
+            relative = file.relative_to(root)
+
+        except ValueError:
+
+            return None
+
+        if relative.suffix != ".py":
+            return None
+
+        parts = list(
+            relative.with_suffix("").parts
+        )
+
+        if not parts:
+            return None
+
+        # Root main.py -> not a package module.
+        if len(parts) == 1:
+            return None
+
+        # Every parent directory must be a package.
+        current = root
+
+        for part in parts[:-1]:
+
+            current = current / part
+
+            if not (
+                current.is_dir()
+                and (
+                    current / "__init__.py"
+                ).is_file()
+            ):
+
+                return None
+
+        return ".".join(parts)
+
+    def _find_package_main(
+        self,
+        root: Path,
+    ) -> Optional[Tuple[str, str]]:
+
+        candidates = []
+
+        try:
+
+            for file in root.rglob("main.py"):
+
+                relative = file.relative_to(root)
+
+                if any(
+                    part in _IGNORED_DIRS
+                    for part in relative.parts
+                ):
+                    continue
+
+                module = self._module_from_file(
+                    root,
+                    file,
+                )
+
+                if module:
+
+                    candidates.append(
+                        (
+                            str(file),
+                            module,
+                        )
+                    )
+
+        except Exception:
+
+            self.logger.exception(
+                "Error while searching package main"
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                item[0].count(os.sep),
+                item[0].lower(),
+            )
+        )
+
+        if candidates:
+
+            file, module = candidates[0]
+
+            return (
+                "module",
+                module,
+            )
+
+        return None
+
+    def discover_entrypoint(
+        self,
+    ) -> Tuple[str, str]:
+
+        root = Path(
+            self.config.resolve_cwd(
+                self.settings["bots_dir"]
+            )
+        )
+
+        requested = self._normalise_run()
+
+        self.logger.info(
+            "Requested run entry: %s",
+            requested,
+        )
+
+        # -----------------------------------------------------
+        # 1. Exact file
+        # -----------------------------------------------------
+
+        exact = root / requested
+
+        if exact.is_file():
+
+            self.logger.info(
+                "Entry point selected: file -> %s",
+                exact,
+            )
+
+            return (
+                "file",
+                str(exact),
+            )
+
+        # -----------------------------------------------------
+        # 2. Add .py automatically
+        # -----------------------------------------------------
+
+        if not requested.endswith(".py"):
+
+            py_file = root / (
+                requested + ".py"
+            )
+
+            if py_file.is_file():
+
+                self.logger.info(
+                    "Entry point selected: file -> %s",
+                    py_file,
+                )
+
+                return (
+                    "file",
+                    str(py_file),
+                )
+
+        # -----------------------------------------------------
+        # 3. package/main
+        # -----------------------------------------------------
+
+        package_request = requested.replace(
+            "/",
+            ".",
+        )
+
+        if package_request.endswith(".py"):
+
+            package_request = package_request[
+                :-3
+            ]
+
+        module_file = root / (
+            package_request.replace(
+                ".",
+                os.sep,
+            )
+            + ".py"
+        )
+
+        if module_file.is_file():
+
+            module_parts = package_request.split(".")
+
+            if len(module_parts) > 1:
+
+                package_root = root
+
+                valid_package = True
+
+                for part in module_parts[:-1]:
+
+                    package_root = (
+                        package_root / part
+                    )
+
+                    if not (
+                        package_root.is_dir()
+                        and (
+                            package_root
+                            / "__init__.py"
+                        ).is_file()
+                    ):
+
+                        valid_package = False
+                        break
+
+                if valid_package:
+
+                    self.logger.info(
+                        "Entry point selected: "
+                        "module -> %s",
+                        package_request,
+                    )
+
+                    return (
+                        "module",
+                        package_request,
+                    )
+
+        # -----------------------------------------------------
+        # 4. Automatic root main.py
+        # -----------------------------------------------------
+
+        root_main = root / "main.py"
+
+        if root_main.is_file():
+
+            self.logger.info(
+                "Requested entry not found. "
+                "Automatically selected root main.py: %s",
+                root_main,
+            )
+
+            return (
+                "file",
+                str(root_main),
+            )
+
+        # -----------------------------------------------------
+        # 5. Common entry files
+        # -----------------------------------------------------
+
+        for filename in (
+            "app.py",
+            "bot.py",
+            "run.py",
+            "start.py",
+            "server.py",
+        ):
+
+            candidate = root / filename
+
+            if candidate.is_file():
+
+                self.logger.info(
+                    "Automatically selected entry point: %s",
+                    candidate,
+                )
+
+                return (
+                    "file",
+                    str(candidate),
+                )
+
+        # -----------------------------------------------------
+        # 6. Search package/main.py
+        # -----------------------------------------------------
+
+        package_main = self._find_package_main(
+            root
+        )
+
+        if package_main:
+
+            mode, value = package_main
+
+            self.logger.info(
+                "Automatically selected package entry: %s",
+                value,
+            )
+
+            return (
+                mode,
+                value,
+            )
+
+        # -----------------------------------------------------
+        # Nothing found
+        # -----------------------------------------------------
+
+        raise FileNotFoundError(
+            "Could not determine bot entry point. "
+            f"Requested={requested!r}, "
+            f"root={root}"
+        )
+
+    # ---------------------------------------------------------
+    # DOWNLOAD
+    # ---------------------------------------------------------
 
     def download_source(self) -> None:
 
@@ -332,6 +786,7 @@ class BotSupervisor:
         ):
 
             if target.exists():
+
                 shutil.rmtree(target)
 
             self.logger.info(
@@ -356,11 +811,13 @@ class BotSupervisor:
             src = Path(source)
 
             if not src.exists():
+
                 raise FileNotFoundError(
                     f"Source not found: {source}"
                 )
 
             if target.exists():
+
                 shutil.rmtree(target)
 
             shutil.copytree(
@@ -368,20 +825,29 @@ class BotSupervisor:
                 target,
             )
 
+        self.print_tree()
+
+    # ---------------------------------------------------------
+    # START
+    # ---------------------------------------------------------
+
     def start(self) -> None:
 
-        cwd = self.config.resolve_cwd(
-            self.settings["bots_dir"]
-        )
-
-        runfile = self.config.resolve_runfile(
-            self.settings["bots_dir"]
-        )
-
-        if not os.path.isfile(runfile):
-            raise FileNotFoundError(
-                f"Run file not found: {runfile}"
+        cwd = Path(
+            self.config.resolve_cwd(
+                self.settings["bots_dir"]
             )
+        )
+
+        if not cwd.is_dir():
+
+            raise FileNotFoundError(
+                f"Bot directory not found: {cwd}"
+            )
+
+        mode, entrypoint = (
+            self.discover_entrypoint()
+        )
 
         env = os.environ.copy()
 
@@ -389,21 +855,59 @@ class BotSupervisor:
             self.config.env
         )
 
-        command = [
-            self.config.python,
-            runfile,
-            *self.config.args,
-        ]
+        if mode == "file":
+
+            command = [
+                self.config.python,
+                entrypoint,
+                *self.config.args,
+            ]
+
+        else:
+
+            command = [
+                self.config.python,
+                "-m",
+                entrypoint,
+                *self.config.args,
+            ]
+
+        self.entrypoint = (
+            mode,
+            entrypoint,
+        )
 
         self.logger.info(
-            "Starting %s: %s",
+            "Starting %s",
             self.config.name,
-            " ".join(command),
+        )
+
+        self.logger.info(
+            "Working directory: %s",
+            cwd,
+        )
+
+        self.logger.info(
+            "Entry type: %s",
+            mode,
+        )
+
+        self.logger.info(
+            "Entry point: %s",
+            entrypoint,
+        )
+
+        self.logger.info(
+            "Command: %s",
+            " ".join(
+                repr(str(x))
+                for x in command
+            ),
         )
 
         self.process = subprocess.Popen(
             command,
-            cwd=cwd,
+            cwd=str(cwd),
             env=env,
         )
 
@@ -412,6 +916,10 @@ class BotSupervisor:
             self.config.name,
             self.process.pid,
         )
+
+    # ---------------------------------------------------------
+    # STOP
+    # ---------------------------------------------------------
 
     def stop(self) -> None:
 
@@ -428,6 +936,7 @@ class BotSupervisor:
             self.process.terminate()
 
             try:
+
                 self.process.wait(
                     timeout=self.settings[
                         "shutdown_timeout"
@@ -445,6 +954,7 @@ class BotSupervisor:
 
 
 class MultiBots:
+
     def __init__(
         self,
         settings: Optional[
@@ -457,6 +967,7 @@ class MultiBots:
         )
 
         if settings:
+
             self.settings.update(
                 settings
             )
@@ -473,11 +984,22 @@ class MultiBots:
 
     def run(self) -> None:
 
-        configs = ConfigLoader(
-            self.settings
-        ).load()
+        try:
+
+            configs = ConfigLoader(
+                self.settings
+            ).load()
+
+        except ConfigError:
+
+            self.logger.exception(
+                "Configuration error"
+            )
+
+            return
 
         if not configs:
+
             self.logger.warning(
                 "No bots configured"
             )
@@ -502,6 +1024,7 @@ class MultiBots:
             try:
 
                 supervisor.download_source()
+
                 supervisor.start()
 
             except Exception:
@@ -539,6 +1062,7 @@ class MultiBots:
                     )
 
                     if limit is None:
+
                         limit = self.settings[
                             "max_restarts"
                         ]
@@ -553,6 +1077,7 @@ class MultiBots:
                         )
 
                         if delay is None:
+
                             delay = self.settings[
                                 "restart_delay_base"
                             ]
@@ -570,6 +1095,7 @@ class MultiBots:
                         )
 
                         try:
+
                             supervisor.start()
 
                         except Exception:
@@ -598,6 +1124,7 @@ class MultiBots:
         self.running = False
 
         for supervisor in self.supervisors:
+
             supervisor.stop()
 
 
@@ -611,6 +1138,7 @@ def main() -> None:
     ):
 
         app.shutdown()
+
         raise SystemExit(0)
 
     signal.signal(
@@ -627,4 +1155,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+
     main()
