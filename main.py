@@ -30,7 +30,7 @@ __version__ = "2.1.1"
 DEFAULTS: Dict[str, Any] = {
     "port": int(os.environ.get("MB_PORT", "10000")),
     "host": os.environ.get("MB_HOST", "0.0.0.0"),
-    "bots_dir": os.environ.get("MB_BOTS_DIR", "/app/bots"),
+    "bots_dir": os.environ.get("MB_BOTS_DIR", "/tmp/bots"), 
     "config_path": os.environ.get("MB_CONFIG_PATH", "config.json"),
     "log_level": os.environ.get("MB_LOG_LEVEL", "INFO"),
     "log_dir": os.environ.get("MB_LOG_DIR", "logs"),
