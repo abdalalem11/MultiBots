@@ -1,0 +1,13 @@
+telethon
+requests
+tabulate
+ipaddress
+redis
+telegraph
+python-decouple
+Pillow
+pytz
+gitpython
+yt-dlp
+ytdl
+youtube-search-python
