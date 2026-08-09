@@ -1,9 +1,9 @@
 {
   "Tepthon": {
-    "source": "https://github.com/abdalalem11/MultiBots.git",
+    "source": "https://github.com/abdalalem11/Tepthon.git",
+    "run": "main.py",
     "env": {
       "TOKEN": ""
-    },
-    "run": "main.py"
+    }
   }
 }
