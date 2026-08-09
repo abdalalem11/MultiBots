@@ -1,45 +1,31 @@
 {
-    "_dashboard": {
-        "_comment": "Optional. If omitted, dashboard auto-generates a password and prints it to stdout on first boot. Set 'password_hash' (pbkdf2_sha256$...) to use a fixed password. Run: python -c \"import dashboard; print(dashboard.hash_password('yourpw'))\" to generate.",
-        "password_hash": "",
-        "session_secret": ""
-    },
-    "_global": {
-        "_comment": "Optional. Inheritable defaults for every bot. Per-bot values override these.",
-        "max_restarts": 5,
-        "restart_delay_base": 2.0
-    },
+  "_dashboard": {
+    "password_hash": "pbkdf2_sha256$240000$fad7f3a5b7570fef88bb9b3d415d93d5$45584ac87eb827f541b13fe4d5398d1b5ad81a2bd8c95a8d37faa9dd686afc6d",
+    "session_secret": ""
+  },
 
-    "bot1": {
-        "source": "https://github.com/<GitHub Username>/<repo1>.git",
-        "run": "main.py",
-        "env": {
-            "TOKEN": ""
-        },
-        "enabled": true,
-        "max_restarts": 5,
-        "restart_delay_base": 2.0,
-        "health_url": "",
-        "health_timeout": 5.0,
-        "args": [],
-        "timeout_graceful": 10.0
-    },
+  "_global": {
+    "max_restarts": 5,
+    "restart_delay_base": 2.0
+  },
 
-    "bot2": {
-        "source": "https://github.com/<GitHub Username>/<repo2>.git",
-        "run": "bot.py",
-        "env": {
-            "TOKEN": ""
-        },
-        "enabled": true
+  "Tepthon": {
+    "source": "https://github.com/abdalalem11/Tepthon.git",
+    "run": "main.py",
+    "env": {
+      "API_ID": "",
+      "API_HASH": "",
+      "SESSION": "",
+      "BOT_TOKEN": "",
+      "REDIS_URI": "",
+      "REDIS_PASSWORD": ""
     },
-
-    "bot3": {
-        "source": "https://<GitHub Username>:<GitHub Token>@github.com/<GitHub Username>/<private-repo>.git",
-        "run": "main.py",
-        "env": {
-            "TOKEN": ""
-        },
-        "enabled": true
-    }
+    "enabled": true,
+    "max_restarts": 5,
+    "restart_delay_base": 2.0,
+    "health_url": "",
+    "health_timeout": 5.0,
+    "args": [],
+    "timeout_graceful": 10.0
+  }
 }
