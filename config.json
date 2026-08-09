@@ -1,7 +1,7 @@
 {
   "Tepthon": {
     "source": "https://github.com/abdalalem11/Tepthon.git",
-    "run": "Tepthon",
+    "run": "main",
     "env": {
       "TOKEN": ""
     },
