@@ -4,6 +4,7 @@
     "run": "main.py",
     "env": {
       "TOKEN": ""
-    }
+    },
+    "enabled": true
   }
 }
