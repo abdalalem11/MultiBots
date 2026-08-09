@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-version = "2.2.0"
+version = "2.2.1"
 
 DEFAULTS: Dict[str, Any] = {
 "port": int(os.environ.get("MB_PORT", "10000")),
@@ -31,22 +31,45 @@ DEFAULTS: Dict[str, Any] = {
 "log_level": os.environ.get("MB_LOG_LEVEL", "INFO"),
 "start_delay": float(os.environ.get("MB_START_DELAY", "2")),
 "max_restarts": int(os.environ.get("MB_MAX_RESTARTS", "5")),
-"restart_delay_base": float(os.environ.get("MB_RESTART_DELAY_BASE", "2")),
-"watchdog_interval": float(os.environ.get("MB_WATCHDOG_INTERVAL", "10")),
-"shutdown_timeout": float(os.environ.get("MB_SHUTDOWN_TIMEOUT", "15")),
+"restart_delay_base": float(
+os.environ.get("MB_RESTART_DELAY_BASE", "2")
+),
+"watchdog_interval": float(
+os.environ.get("MB_WATCHDOG_INTERVAL", "10")
+),
+"shutdown_timeout": float(
+os.environ.get("MB_SHUTDOWN_TIMEOUT", "15")
+),
 }
 
 _RESERVED_KEYS = {"_dashboard", "_global"}
-BOT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+
+BOT_NAME_RE = re.compile(
+r"^[A-Za-z][A-Za-z0-9-]{0,63}$"
+)
+
 _REQUIRED_BOT_KEYS = {"source", "run"}
+
+def utc_now_iso() -> str:
+return datetime.now(timezone.utc).strftime(
+"%Y-%m-%dT%H:%M:%SZ"
+)
 
 def setup_logging(level: str = "INFO") -> logging.Logger:
 logging.basicConfig(
-level=getattr(level.upper(), "INFO", logging.INFO),
-format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+level=getattr(
+logging,
+level.upper(),
+logging.INFO
+),
+format=(
+"%(asctime)s %(levelname)-7s "
+"[%(name)s] %(message)s"
+),
 stream=sys.stdout,
 force=True,
 )
+
 return logging.getLogger("multibots")
 
 class ConfigError(Exception):
@@ -59,122 +82,252 @@ source: str
 run: str
 
 env: Dict[str, str] = field(default_factory=dict)
+
 enabled: bool = True
 
 max_restarts: Optional[int] = None
+
 restart_delay_base: Optional[float] = None
 
 cwd: Optional[str] = None
-python: str = field(default_factory=lambda: sys.executable)
+
+python: str = field(
+    default_factory=lambda: sys.executable
+)
 
 args: List[str] = field(default_factory=list)
 
-# file = python main.py
-# module = python -m package.module
+# file:
+#   python main.py
+#
+# module:
+#   python -m package.module
 mode: str = "file"
 
-def resolve_cwd(self, bots_dir: str) -> str:
+def resolve_cwd(
+    self,
+    bots_dir: str
+) -> str:
+
     if self.cwd:
-        return (
+
+        if os.path.isabs(self.cwd):
+            return self.cwd
+
+        return os.path.join(
+            bots_dir,
             self.cwd
-            if os.path.isabs(self.cwd)
-            else os.path.join(bots_dir, self.cwd)
         )
 
-    return os.path.join(bots_dir, self.name)
+    return os.path.join(
+        bots_dir,
+        self.name
+    )
 
-def resolve_runfile(self, bots_dir: str) -> str:
-    return os.path.join(self.resolve_cwd(bots_dir), self.run)
+def resolve_runfile(
+    self,
+    bots_dir: str
+) -> str:
+
+    return os.path.join(
+        self.resolve_cwd(bots_dir),
+        self.run
+    )
 
 class ConfigLoader:
-def init(self, settings: Dict[str, Any]):
-self.settings = settings
 
-def load(self, path: Optional[str] = None) -> List[BotConfig]:
-    config_path = path or self.settings["config_path"]
+def __init__(
+    self,
+    settings: Dict[str, Any]
+):
+    self.settings = settings
+
+def load(
+    self,
+    path: Optional[str] = None
+) -> List[BotConfig]:
+
+    config_path = (
+        path
+        or self.settings["config_path"]
+    )
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+
+        with open(
+            config_path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             data = json.load(f)
 
     except FileNotFoundError as e:
+
         raise ConfigError(
             f"Config file not found: {config_path}"
         ) from e
 
     except json.JSONDecodeError as e:
+
         raise ConfigError(
             f"Invalid JSON in {config_path}: {e}"
         ) from e
 
-    bots_data = data.get("bots", data) if isinstance(data, dict) else data
+    if isinstance(data, dict):
+
+        bots_data = data.get(
+            "bots",
+            data
+        )
+
+    else:
+
+        bots_data = data
 
     if isinstance(bots_data, dict):
+
         items = []
 
         for name, value in bots_data.items():
+
             if name in _RESERVED_KEYS:
                 continue
 
             if isinstance(value, dict):
+
                 value = dict(value)
-                value.setdefault("name", name)
+
+                value.setdefault(
+                    "name",
+                    name
+                )
+
                 items.append(value)
 
     elif isinstance(bots_data, list):
+
         items = bots_data
 
     else:
+
         raise ConfigError(
-            "config.json must contain a list of bots or a bots object"
+            "config.json must contain "
+            "a list of bots or a bots object"
         )
 
     bots: List[BotConfig] = []
 
     for item in items:
-        if not isinstance(item, dict):
-            raise ConfigError("Each bot must be an object")
 
-        name = str(item.get("name", "")).strip()
+        if not isinstance(
+            item,
+            dict
+        ):
+
+            raise ConfigError(
+                "Each bot must be an object"
+            )
+
+        name = str(
+            item.get(
+                "name",
+                ""
+            )
+        ).strip()
 
         if not _BOT_NAME_RE.match(name):
-            raise ConfigError(f"Invalid bot name: {name!r}")
+
+            raise ConfigError(
+                f"Invalid bot name: {name!r}"
+            )
 
         missing = [
-            key for key in _REQUIRED_BOT_KEYS
+            key
+            for key in _REQUIRED_BOT_KEYS
             if not item.get(key)
         ]
 
         if missing:
+
             raise ConfigError(
-                f"Bot {name}: missing {', '.join(missing)}"
+                f"Bot {name}: missing "
+                f"{', '.join(missing)}"
             )
 
-        mode = str(item.get("mode", "file")).lower().strip()
+        mode = str(
+            item.get(
+                "mode",
+                "file"
+            )
+        ).lower().strip()
 
-        if mode not in {"file", "module"}:
+        if mode not in {
+            "file",
+            "module"
+        }:
+
             raise ConfigError(
-                f"Bot {name}: mode must be 'file' or 'module'"
+                f"Bot {name}: mode must be "
+                "'file' or 'module'"
             )
 
         bots.append(
             BotConfig(
                 name=name,
-                source=str(item["source"]),
-                run=str(item["run"]),
+
+                source=str(
+                    item["source"]
+                ),
+
+                run=str(
+                    item["run"]
+                ),
+
                 env={
                     str(k): str(v)
-                    for k, v in dict(item.get("env", {})).items()
+                    for k, v in dict(
+                        item.get(
+                            "env",
+                            {}
+                        )
+                    ).items()
                 },
-                enabled=bool(item.get("enabled", True)),
-                max_restarts=item.get("max_restarts"),
-                restart_delay_base=item.get("restart_delay_base"),
-                cwd=item.get("cwd"),
-                python=str(item.get("python", sys.executable)),
+
+                enabled=bool(
+                    item.get(
+                        "enabled",
+                        True
+                    )
+                ),
+
+                max_restarts=item.get(
+                    "max_restarts"
+                ),
+
+                restart_delay_base=item.get(
+                    "restart_delay_base"
+                ),
+
+                cwd=item.get(
+                    "cwd"
+                ),
+
+                python=str(
+                    item.get(
+                        "python",
+                        sys.executable
+                    )
+                ),
+
                 args=[
                     str(x)
-                    for x in item.get("args", [])
+                    for x in item.get(
+                        "args",
+                        []
+                    )
                 ],
+
                 mode=mode,
             )
         )
@@ -182,20 +335,28 @@ def load(self, path: Optional[str] = None) -> List[BotConfig]:
     return bots
 
 class BotSupervisor:
-def init(
-self,
-config: BotConfig,
-settings: Dict[str, Any],
-logger: logging.Logger,
-):
-self.config = config
-self.settings = settings
-self.logger = logger
 
-    self.process: Optional[subprocess.Popen] = None
+def __init__(
+    self,
+    config: BotConfig,
+    settings: Dict[str, Any],
+    logger: logging.Logger
+):
+
+    self.config = config
+
+    self.settings = settings
+
+    self.logger = logger
+
+    self.process: Optional[
+        subprocess.Popen
+    ] = None
+
     self.restarts = 0
 
 def download_source(self) -> None:
+
     target = Path(
         self.config.resolve_cwd(
             self.settings["bots_dir"]
@@ -209,9 +370,21 @@ def download_source(self) -> None:
 
     source = self.config.source
 
-    if source.startswith(("http://", "https://")):
+    if source.startswith(
+        (
+            "http://",
+            "https://"
+        )
+    ):
+
         if target.exists():
+
             shutil.rmtree(target)
+
+        self.logger.info(
+            "Cloning %s...",
+            self.config.name
+        )
 
         subprocess.run(
             [
@@ -220,44 +393,54 @@ def download_source(self) -> None:
                 "--depth",
                 "1",
                 source,
-                str(target),
+                str(target)
             ],
-            check=True,
+            check=True
         )
 
     else:
+
         src = Path(source)
 
         if not src.exists():
+
             raise FileNotFoundError(
                 f"Source not found: {source}"
             )
 
         if target.exists():
+
             shutil.rmtree(target)
 
-        shutil.copytree(src, target)
+        shutil.copytree(
+            src,
+            target
+        )
 
 def start(self) -> None:
+
     cwd = self.config.resolve_cwd(
         self.settings["bots_dir"]
     )
 
     env = os.environ.copy()
-    env.update(self.config.env)
 
-    # -----------------------------------------
-    # Normal Python file
-    # Example:
-    # "run": "main.py",
-    # "mode": "file"
-    # -----------------------------------------
+    env.update(
+        self.config.env
+    )
+
     if self.config.mode == "file":
-        runfile = self.config.resolve_runfile(
-            self.settings["bots_dir"]
+
+        runfile = (
+            self.config.resolve_runfile(
+                self.settings["bots_dir"]
+            )
         )
 
-        if not os.path.isfile(runfile):
+        if not os.path.isfile(
+            runfile
+        ):
+
             raise FileNotFoundError(
                 f"Run file not found: {runfile}"
             )
@@ -265,143 +448,210 @@ def start(self) -> None:
         command = [
             self.config.python,
             runfile,
-            *self.config.args,
+            *self.config.args
         ]
 
-    # -----------------------------------------
-    # Python module
-    # Example:
-    # "run": "main",
-    # "mode": "module"
-    #
-    # Runs:
-    # python -m main
-    # -----------------------------------------
     else:
+
         module = self.config.run.strip()
 
         if module.endswith(".py"):
+
             module = module[:-3]
 
-        module = module.replace("/", ".")
-        module = module.replace("\\", ".")
+        module = module.replace(
+            "/",
+            "."
+        )
+
+        module = module.replace(
+            "\\",
+            "."
+        )
 
         command = [
             self.config.python,
             "-m",
             module,
-            *self.config.args,
+            *self.config.args
         ]
 
     self.logger.info(
         "Starting %s: %s",
         self.config.name,
-        " ".join(command),
+        " ".join(command)
     )
 
     self.process = subprocess.Popen(
         command,
         cwd=cwd,
-        env=env,
+        env=env
     )
 
     self.logger.info(
         "Started %s (pid=%s)",
         self.config.name,
-        self.process.pid,
+        self.process.pid
     )
 
 def stop(self) -> None:
-    if self.process and self.process.poll() is None:
+
+    if (
+        self.process
+        and self.process.poll() is None
+    ):
+
+        self.logger.info(
+            "Stopping %s",
+            self.config.name
+        )
+
         self.process.terminate()
 
         try:
+
             self.process.wait(
-                timeout=self.settings["shutdown_timeout"]
+                timeout=self.settings[
+                    "shutdown_timeout"
+                ]
             )
 
         except subprocess.TimeoutExpired:
+
+            self.logger.warning(
+                "Force killing %s",
+                self.config.name
+            )
+
             self.process.kill()
 
 class MultiBots:
-def init(
-self,
-settings: Optional[Dict[str, Any]] = None
+
+def __init__(
+    self,
+    settings: Optional[
+        Dict[str, Any]
+    ] = None
 ):
-self.settings = dict(DEFAULTS)
+
+    self.settings = dict(
+        DEFAULTS
+    )
 
     if settings:
-        self.settings.update(settings)
+
+        self.settings.update(
+            settings
+        )
 
     self.logger = setup_logging(
         self.settings["log_level"]
     )
 
-    self.supervisors: List[BotSupervisor] = []
+    self.supervisors: List[
+        BotSupervisor
+    ] = []
+
     self.running = True
 
 def run(self) -> None:
+
     configs = ConfigLoader(
         self.settings
     ).load()
 
+    if not configs:
+
+        self.logger.warning(
+            "No bots configured"
+        )
+
     for config in configs:
+
         if not config.enabled:
+
             self.logger.info(
                 "Skipping disabled bot: %s",
-                config.name,
+                config.name
             )
+
             continue
 
         supervisor = BotSupervisor(
             config,
             self.settings,
-            self.logger,
+            self.logger
         )
 
         try:
+
             supervisor.download_source()
+
             supervisor.start()
 
         except Exception:
+
             self.logger.exception(
                 "Failed to start %s",
-                config.name,
+                config.name
             )
+
             continue
 
-        self.supervisors.append(supervisor)
+        self.supervisors.append(
+            supervisor
+        )
 
         time.sleep(
-            self.settings["start_delay"]
+            self.settings[
+                "start_delay"
+            ]
         )
 
     while self.running:
-        for supervisor in self.supervisors:
+
+        for supervisor in (
+            self.supervisors
+        ):
+
             proc = supervisor.process
 
-            if proc and proc.poll() is not None:
+            if (
+                proc
+                and proc.poll() is not None
+            ):
 
-                limit = supervisor.config.max_restarts
+                limit = (
+                    supervisor.config.max_restarts
+                )
 
                 if limit is None:
-                    limit = self.settings["max_restarts"]
+
+                    limit = self.settings[
+                        "max_restarts"
+                    ]
 
                 if supervisor.restarts < limit:
+
                     supervisor.restarts += 1
 
                     delay = (
-                        supervisor.config.restart_delay_base
+                        supervisor.config
+                        .restart_delay_base
                     )
 
                     if delay is None:
+
                         delay = self.settings[
                             "restart_delay_base"
                         ]
 
                     self.logger.warning(
-                        "Restarting %s",
+                        "Restarting %s "
+                        "(attempt %s/%s)",
                         supervisor.config.name,
+                        supervisor.restarts,
+                        limit
                     )
 
                     time.sleep(
@@ -409,35 +659,51 @@ def run(self) -> None:
                     )
 
                     try:
+
                         supervisor.start()
 
                     except Exception:
+
                         self.logger.exception(
                             "Failed to restart %s",
-                            supervisor.config.name,
+                            supervisor.config.name
                         )
 
                 else:
+
                     self.logger.error(
-                        "Restart limit reached for %s",
-                        supervisor.config.name,
+                        "Restart limit reached "
+                        "for %s",
+                        supervisor.config.name
                     )
 
         time.sleep(
-            self.settings["watchdog_interval"]
+            self.settings[
+                "watchdog_interval"
+            ]
         )
 
 def shutdown(self) -> None:
+
     self.running = False
 
-    for supervisor in self.supervisors:
+    for supervisor in (
+        self.supervisors
+    ):
+
         supervisor.stop()
 
 def main() -> None:
+
 app = MultiBots()
 
-def handle_signal(signum, frame):
+def handle_signal(
+    signum,
+    frame
+):
+
     app.shutdown()
+
     raise SystemExit(0)
 
 signal.signal(
@@ -453,4 +719,5 @@ signal.signal(
 app.run()
 
 if name == "main":
+
 main()
