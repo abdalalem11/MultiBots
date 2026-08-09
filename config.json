@@ -1,7 +1,8 @@
 {
   "Tepthon": {
     "source": "https://github.com/abdalalem11/Tepthon.git",
-    "run": "main.py",
+    "run": "__main__.py",
+    "cwd": "Tepthon",
     "env": {
       "TOKEN": ""
     },
