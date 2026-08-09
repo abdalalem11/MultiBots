@@ -1,0 +1,35 @@
+#!/bin/bash
+
+if [ ! -d "$HOME/storage" ]; then
+    printf "Setting up storage permission...\n"
+    termux-setup-storage
+else
+    printf "Storage already set up.\n"
+fi
+
+if [ -d "resources" ]; then
+    echo "Tepthon already cloned."
+else
+    apt install git -y
+    git clone https://github.com/tepthon-arabic/Tepthon
+    cd Tepthon
+fi
+
+printf "Updating system...\n\n"
+pkg update -y && apt update && apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+if ! command -v python3 &> /dev/null; then
+    printf "Python not found, installing...\nThis may take some time...\n"
+    pkg install python3 -y
+fi
+
+printf "Applying magical effects...\n"
+pip install -q colorama 
+
+printf "Installing required packages for Pillow...\n\n"
+pip install wheel
+pkg install libjpeg-turbo
+LDFLAGS="-L/system/lib/" CFLAGS="-I/data/data/com.termux/files/usr/include/"
+
+printf "Running installation tool...\n"
+python3 resources/install/_termux.py
