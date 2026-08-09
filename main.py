@@ -1,13 +1,8 @@
 """
-MultiBots — Git Source Downloader + Process Supervisor
-========================================================
-- Reads config.json
-- Clones each bot from "source" automatically
-- Updates existing Git repositories with git pull
-- Installs each bot requirements.txt automatically
-- Runs the configured Python entry file
-- Restarts crashed bots
-- Works with Render / Docker / VPS
+MultiBots - Multi-bot supervisor
+---------------------------------
+Downloads bot sources from config.json automatically,
+then starts and supervises each bot.
 """
 
 from __future__ import annotations
@@ -15,181 +10,388 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+import traceback
+from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import psutil
+import requests
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+__version__ = "2.1.0"
 
-VERSION = "3.0.0"
+__all__ = [
+    "BotConfig",
+    "BotState",
+    "BotSupervisor",
+    "MetricsCollector",
+    "ConfigLoader",
+    "WebhookNotifier",
+    "KeepAlivePinger",
+    "GracefulShutdown",
+    "MultiBots",
+    "DEFAULTS",
+    "setup_logging",
+    "utc_now_iso",
+]
 
-BASE_DIR = Path(os.environ.get("MB_BASE_DIR", "/app"))
-CONFIG_PATH = Path(os.environ.get("MB_CONFIG_PATH", str(BASE_DIR / "config.json")))
 
-BOTS_DIR = Path(os.environ.get("MB_BOTS_DIR", str(BASE_DIR)))
+# ============================================================================
+# 1. DEFAULT SETTINGS
+# ============================================================================
 
-LOG_LEVEL = os.environ.get("MB_LOG_LEVEL", "INFO").upper()
+DEFAULTS: Dict[str, Any] = {
+    "port": int(os.environ.get("MB_PORT", "10000")),
+    "host": os.environ.get("MB_HOST", "0.0.0.0"),
 
-START_DELAY = float(os.environ.get("MB_START_DELAY", "2"))
-RESTART_DELAY = float(os.environ.get("MB_RESTART_DELAY", "5"))
-MAX_RESTARTS = int(os.environ.get("MB_MAX_RESTARTS", "10"))
+    # Directory where downloaded bots are stored.
+    "bots_dir": os.environ.get("MB_BOTS_DIR", "/app/bots"),
 
-BOT_INSTALL_REQUIREMENTS = (
-    os.environ.get("MB_INSTALL_BOT_REQUIREMENTS", "true").lower()
-    in ("1", "true", "yes", "on")
+    "config_path": os.environ.get(
+        "MB_CONFIG_PATH",
+        "config.json",
+    ),
+
+    "log_level": os.environ.get(
+        "MB_LOG_LEVEL",
+        "INFO",
+    ),
+
+    "log_dir": os.environ.get(
+        "MB_LOG_DIR",
+        "logs",
+    ),
+
+    "log_max_bytes": int(
+        os.environ.get(
+            "MB_LOG_MAX_BYTES",
+            str(5 * 1024 * 1024),
+        )
+    ),
+
+    "log_backup_count": int(
+        os.environ.get(
+            "MB_LOG_BACKUP_COUNT",
+            "5",
+        )
+    ),
+
+    "start_delay": float(
+        os.environ.get(
+            "MB_START_DELAY",
+            "2",
+        )
+    ),
+
+    "max_restarts": int(
+        os.environ.get(
+            "MB_MAX_RESTARTS",
+            "5",
+        )
+    ),
+
+    "restart_delay_base": float(
+        os.environ.get(
+            "MB_RESTART_DELAY_BASE",
+            "2",
+        )
+    ),
+
+    "restart_delay_max": float(
+        os.environ.get(
+            "MB_RESTART_DELAY_MAX",
+            "120",
+        )
+    ),
+
+    "watchdog_interval": float(
+        os.environ.get(
+            "MB_WATCHDOG_INTERVAL",
+            "10",
+        )
+    ),
+
+    "ping_interval": float(
+        os.environ.get(
+            "MB_PING_INTERVAL",
+            "120",
+        )
+    ),
+
+    "ping_url": os.environ.get(
+        "MB_PING_URL",
+        "http://127.0.0.1:10000/",
+    ),
+
+    "webhook_url": os.environ.get(
+        "MB_WEBHOOK_URL",
+        "",
+    ),
+
+    "webhook_timeout": float(
+        os.environ.get(
+            "MB_WEBHOOK_TIMEOUT",
+            "5",
+        )
+    ),
+
+    "shutdown_timeout": float(
+        os.environ.get(
+            "MB_SHUTDOWN_TIMEOUT",
+            "15",
+        )
+    ),
+
+    "metrics_history": int(
+        os.environ.get(
+            "MB_METRICS_HISTORY",
+            "180",
+        )
+    ),
+}
+
+
+_RESERVED_KEYS = {
+    "_dashboard",
+    "_global",
+}
+
+
+_BOT_NAME_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_-]{0,63}$"
 )
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
-)
-
-LOG = logging.getLogger("multibots")
+_REQUIRED_BOT_KEYS = {
+    "source",
+    "run",
+}
 
 
-# ---------------------------------------------------------------------------
-# Bot configuration
-# ---------------------------------------------------------------------------
+_OPTIONAL_BOT_KEYS: Dict[str, Any] = {
+    "env": {},
+    "enabled": True,
+    "max_restarts": None,
+    "restart_delay_base": None,
+    "health_url": "",
+    "health_timeout": 5.0,
+    "cwd": None,
+    "python": sys.executable,
+    "args": [],
+    "timeout_graceful": 10.0,
+}
+
+
+# ============================================================================
+# 2. LOGGING
+# ============================================================================
+
+def utc_now_iso() -> str:
+    return datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def setup_logging(
+    level: str = "INFO",
+    log_dir: Optional[str] = None,
+    max_bytes: int = 5 * 1024 * 1024,
+    backup_count: int = 5,
+) -> logging.Logger:
+
+    root = logging.getLogger()
+
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)-7s "
+        "[%(name)s] %(message)s",
+        "%Y-%m-%d %H:%M:%S",
+    )
+
+    console = logging.StreamHandler(
+        sys.stdout
+    )
+
+    console.setFormatter(formatter)
+
+    root.addHandler(console)
+
+    if log_dir:
+        try:
+            Path(log_dir).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            from logging.handlers import RotatingFileHandler
+
+            file_handler = RotatingFileHandler(
+                Path(log_dir) / "multibots.log",
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding="utf-8",
+            )
+
+            file_handler.setFormatter(
+                formatter
+            )
+
+            root.addHandler(file_handler)
+
+        except OSError:
+            pass
+
+    try:
+        root.setLevel(
+            level.upper()
+        )
+    except Exception:
+        root.setLevel(
+            logging.INFO
+        )
+
+    return logging.getLogger(
+        "multibots"
+    )
+
+
+# ============================================================================
+# 3. CONFIGURATION
+# ============================================================================
+
+class ConfigError(Exception):
+    pass
+
 
 @dataclass
 class BotConfig:
+
     name: str
     source: str
     run: str
-    env: Dict[str, str] = field(default_factory=dict)
+
+    env: Dict[str, str] = field(
+        default_factory=dict
+    )
 
     enabled: bool = True
-    python: str = sys.executable
-    args: List[str] = field(default_factory=list)
 
     max_restarts: Optional[int] = None
-    restart_delay: Optional[float] = None
+
+    restart_delay_base: Optional[float] = None
+
+    health_url: str = ""
+
+    health_timeout: float = 5.0
 
     cwd: Optional[str] = None
 
-    def bot_dir(self) -> Path:
+    python: str = field(
+        default_factory=lambda: sys.executable
+    )
+
+    args: List[str] = field(
+        default_factory=list
+    )
+
+    timeout_graceful: float = 10.0
+
+    def resolve_cwd(
+        self,
+        bots_dir: str,
+    ) -> str:
+
         if self.cwd:
-            path = Path(self.cwd)
+            if os.path.isabs(
+                self.cwd
+            ):
+                return self.cwd
 
-            if not path.is_absolute():
-                path = BOTS_DIR / path
+            return os.path.join(
+                bots_dir,
+                self.cwd,
+            )
 
-            return path
+        return os.path.join(
+            bots_dir,
+            self.name,
+        )
 
-        return BOTS_DIR / self.name
+    def resolve_runfile(
+        self,
+        bots_dir: str,
+    ) -> str:
 
-    def run_file(self) -> Path:
-        return self.bot_dir() / self.run
+        return os.path.join(
+            self.resolve_cwd(
+                bots_dir
+            ),
+            self.run,
+        )
+
+    def to_public_dict(
+        self,
+    ) -> Dict[str, Any]:
+
+        return {
+            "name": self.name,
+            "source": self.source,
+            "run": self.run,
+            "enabled": self.enabled,
+            "max_restarts": self.max_restarts,
+            "restart_delay_base": self.restart_delay_base,
+            "health_url": self.health_url,
+            "has_env": bool(self.env),
+            "env_keys": sorted(
+                self.env.keys()
+            ),
+            "cwd": self.cwd,
+            "args": list(self.args),
+            "python": self.python,
+        }
 
 
-# ---------------------------------------------------------------------------
-# Config loader
-# ---------------------------------------------------------------------------
+def _mask(
+    value: str,
+    visible: int = 4,
+) -> str:
+
+    if not value:
+        return ""
+
+    if len(value) <= visible * 2:
+        return "*" * len(value)
+
+    return (
+        value[:visible]
+        + "…"
+        + value[-visible:]
+    )
+
 
 class ConfigLoader:
 
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(
+        self,
+        settings: Dict[str, Any],
+    ):
 
-    def load(self) -> List[BotConfig]:
+        self.settings = settings
 
-        if not self.path.exists():
-            raise RuntimeError(
-                f"config.json not found: {self.path}"
-            )
-
-        try:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Cannot read config.json: {exc}"
-            )
-
-        if not isinstance(data, dict):
-            raise RuntimeError(
-                "config.json must contain a JSON object"
-            )
-
-        bots = []
-
-        for name, raw in data.items():
-
-            if name.startswith("_"):
-                continue
-
-            if not isinstance(raw, dict):
-                LOG.error(
-                    "Skipping '%s': configuration must be an object",
-                    name,
-                )
-                continue
-
-            source = str(raw.get("source", "")).strip()
-            run = str(raw.get("run", "")).strip()
-
-            if not source:
-                LOG.error(
-                    "Skipping '%s': source is missing",
-                    name,
-                )
-                continue
-
-            if not run:
-                LOG.error(
-                    "Skipping '%s': run is missing",
-                    name,
-                )
-                continue
-
-            env = raw.get("env", {}) or {}
-
-            if not isinstance(env, dict):
-                LOG.error(
-                    "Skipping '%s': env must be an object",
-                    name,
-                )
-                continue
-
-            env = {
-                str(k): str(v)
-                for k, v in env.items()
-            }
-
-            bots.append(
-                BotConfig(
-                    name=name,
-                    source=source,
-                    run=run,
-                    env=env,
-                    enabled=bool(
-                        raw.get("enabled", True)
-                    ),
-                    python=str(
-                        raw.get("python", sys.executable)
-                    ),
-                    args=[
-                        str(x)
-                        for x in raw.get("args", [])
-                    ],
-                    max_restarts=(
-                        int(raw["max_restarts"])
-                        if raw.get("max_restarts") is not None
-                        else None
-                    ),
-                    restart_delay=(
-                        float(raw["restart_delay"])
-                        if raw.get("restart_delay") is not None
+    def load(
+        self,
+        path: Optional[str] = None,
