@@ -1,58 +1,191 @@
+import json
 import os
 import subprocess
-import json
-import time
-import flask
 import threading
+import time
+
 import requests
+from flask import Flask
 
-app = flask.Flask(__name__)
+app = Flask(__name__)
 
-@app.route('/')
+
+@app.route("/")
 def home():
     return """
-<center>
-    <img src="https://i.giphy.com/media/3o7abAHdYvZdBNnGZq/giphy.webp" style="border-radius: 12px;"/>
-</center>
-<style>
-    body { background: antiquewhite; }
-</style>
-"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>MultiBots</title>
+        <style>
+            body {
+                background: antiquewhite;
+                text-align: center;
+                padding-top: 50px;
+                font-family: Arial, sans-serif;
+            }
+            img {
+                max-width: 90%;
+                border-radius: 12px;
+            }
+        </style>
+    </head>
+    <body>
+        <img src="https://i.giphy.com/media/3o7abAHdYvZdBNnGZq/giphy.webp">
+        <h2>MultiBots is running</h2>
+    </body>
+    </html>
+    """
 
-def ping_server():
+
+@app.route("/healthz")
+def healthz():
+    return "OK", 200
+
+
+def keep_alive():
+    """
+    Keeps the web service responsive.
+    Render already handles the HTTP service, so this is only
+    a lightweight periodic request.
+    """
     while True:
         try:
-            requests.get('http://0.0.0.0:10000')
-        except:
+            requests.get(
+                "http://127.0.0.1:10000/healthz",
+                timeout=10,
+            )
+        except Exception:
             pass
+
         time.sleep(120)
 
+
 def run_bots():
-    with open("config.json", "r") as jsonfile:
-        bots = json.load(jsonfile)
+    """
+    Load bots from config.json and start each bot.
+    """
 
-    bot_processes = []
+    if not os.path.exists("config.json"):
+        print("ERROR: config.json not found.")
+        return
+
+    try:
+        with open("config.json", "r", encoding="utf-8") as file:
+            bots = json.load(file)
+    except Exception as exc:
+        print(f"ERROR: failed to read config.json: {exc}")
+        return
+
+    processes = []
+
     for bot_name, bot_config in bots.items():
-        time.sleep(5)
-        bot_dir = f"/app/{bot_name}"
-        bot_file = os.path.join(bot_dir, bot_config['run'])
 
-        # Set environment variables for this bot
+        if bot_name.startswith("_"):
+            continue
+
+        if not bot_config.get("enabled", True):
+            print(f"[{bot_name}] disabled.")
+            continue
+
+        bot_dir = os.path.join(os.getcwd(), bot_name)
+
+        if not os.path.isdir(bot_dir):
+            print(f"[{bot_name}] ERROR: directory not found: {bot_dir}")
+            continue
+
+        run_file = bot_config.get("run")
+
+        if not run_file:
+            print(f"[{bot_name}] ERROR: 'run' is missing in config.json")
+            continue
+
+        bot_file = os.path.join(bot_dir, run_file)
+
+        if not os.path.isfile(bot_file):
+            print(f"[{bot_name}] ERROR: run file not found: {bot_file}")
+            continue
+
         bot_env = os.environ.copy()
-        for env_name, env_value in bot_config['env'].items():
-            bot_env[env_name] = env_value
 
-        print(f'Starting {bot_name} bot with {bot_file}')
-        p = subprocess.Popen(['python3', bot_file], cwd=bot_dir, env=bot_env)
-        bot_processes.append(p)
+        for env_name, env_value in bot_config.get("env", {}).items():
+            bot_env[str(env_name)] = str(env_value)
 
-    for p in bot_processes:
-        p.wait()
+        print(f"[{bot_name}] Starting: {bot_file}")
 
-if __name__ == '__main__':
-    # Start ping server in a separate thread
-    threading.Thread(target=ping_server, daemon=True).start()
-    # Start bots in a separate thread
-    threading.Thread(target=run_bots, daemon=True).start()
-    # Run Flask app
-    app.run(host='0.0.0.0', port=10000)
+        try:
+            process = subprocess.Popen(
+                ["python", run_file],
+                cwd=bot_dir,
+                env=bot_env,
+            )
+
+            processes.append((bot_name, process))
+
+        except Exception as exc:
+            print(f"[{bot_name}] ERROR starting bot: {exc}")
+
+        time.sleep(5)
+
+    while True:
+        for bot_name, process in processes:
+
+            return_code = process.poll()
+
+            if return_code is not None:
+                print(
+                    f"[{bot_name}] stopped "
+                    f"(exit={return_code}). Restarting..."
+                )
+
+                try:
+                    bot_config = bots[bot_name]
+                    bot_dir = os.path.join(os.getcwd(), bot_name)
+                    run_file = bot_config["run"]
+
+                    bot_env = os.environ.copy()
+
+                    for env_name, env_value in bot_config.get(
+                        "env", {}
+                    ).items():
+                        bot_env[str(env_name)] = str(env_value)
+
+                    new_process = subprocess.Popen(
+                        ["python", run_file],
+                        cwd=bot_dir,
+                        env=bot_env,
+                    )
+
+                    processes[
+                        processes.index((bot_name, process))
+                    ] = (bot_name, new_process)
+
+                except Exception as exc:
+                    print(
+                        f"[{bot_name}] restart failed: {exc}"
+                    )
+
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+
+    threading.Thread(
+        target=run_bots,
+        daemon=True,
+    ).start()
+
+    threading.Thread(
+        target=keep_alive,
+        daemon=True,
+    ).start()
+
+    port = int(os.environ.get("PORT", "10000"))
+
+    print(f"Web server listening on 0.0.0.0:{port}")
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True,
+    )
