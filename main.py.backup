@@ -1,7 +1,13 @@
 """
-MultiBots — Multi-bot supervisor with automatic Git source deployment.
-
-main.py
+MultiBots — Git Source Downloader + Process Supervisor
+========================================================
+- Reads config.json
+- Clones each bot from "source" automatically
+- Updates existing Git repositories with git pull
+- Installs each bot requirements.txt automatically
+- Runs the configured Python entry file
+- Restarts crashed bots
+- Works with Render / Docker / VPS
 """
 
 from __future__ import annotations
@@ -9,1658 +15,181 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import signal
-import shutil
 import subprocess
 import sys
 import threading
 import time
-import traceback
-
-from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-import psutil
-import requests
-
-
-__version__ = "2.1.0"
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
-# DEFAULT SETTINGS
+# Configuration
 # ---------------------------------------------------------------------------
 
-DEFAULTS: Dict[str, Any] = {
-    "port": int(os.environ.get("MB_PORT", "10000")),
-    "host": os.environ.get("MB_HOST", "0.0.0.0"),
-    "bots_dir": os.environ.get("MB_BOTS_DIR", "/app"),
-    "config_path": os.environ.get("MB_CONFIG_PATH", "config.json"),
+VERSION = "3.0.0"
 
-    "log_level": os.environ.get("MB_LOG_LEVEL", "INFO"),
-    "log_dir": os.environ.get("MB_LOG_DIR", "logs"),
+BASE_DIR = Path(os.environ.get("MB_BASE_DIR", "/app"))
+CONFIG_PATH = Path(os.environ.get("MB_CONFIG_PATH", str(BASE_DIR / "config.json")))
 
-    "start_delay": float(
-        os.environ.get("MB_START_DELAY", "2.0")
-    ),
+BOTS_DIR = Path(os.environ.get("MB_BOTS_DIR", str(BASE_DIR)))
 
-    "max_restarts": int(
-        os.environ.get("MB_MAX_RESTARTS", "5")
-    ),
+LOG_LEVEL = os.environ.get("MB_LOG_LEVEL", "INFO").upper()
 
-    "restart_delay_base": float(
-        os.environ.get("MB_RESTART_DELAY_BASE", "2.0")
-    ),
+START_DELAY = float(os.environ.get("MB_START_DELAY", "2"))
+RESTART_DELAY = float(os.environ.get("MB_RESTART_DELAY", "5"))
+MAX_RESTARTS = int(os.environ.get("MB_MAX_RESTARTS", "10"))
 
-    "restart_delay_max": float(
-        os.environ.get("MB_RESTART_DELAY_MAX", "120.0")
-    ),
-
-    "watchdog_interval": float(
-        os.environ.get("MB_WATCHDOG_INTERVAL", "5.0")
-    ),
-
-    "ping_interval": float(
-        os.environ.get("MB_PING_INTERVAL", "120.0")
-    ),
-
-    "ping_url": os.environ.get(
-        "MB_PING_URL",
-        "http://127.0.0.1:10000/"
-    ),
-
-    "webhook_url": os.environ.get(
-        "MB_WEBHOOK_URL",
-        ""
-    ),
-
-    "webhook_timeout": float(
-        os.environ.get("MB_WEBHOOK_TIMEOUT", "5.0")
-    ),
-
-    "shutdown_timeout": float(
-        os.environ.get("MB_SHUTDOWN_TIMEOUT", "15.0")
-    ),
-
-    "metrics_history": int(
-        os.environ.get("MB_METRICS_HISTORY", "180")
-    ),
-}
-
-
-_RESERVED_KEYS = {
-    "_dashboard",
-    "_global",
-}
-
-
-_BOT_NAME_RE = re.compile(
-    r"^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+BOT_INSTALL_REQUIREMENTS = (
+    os.environ.get("MB_INSTALL_BOT_REQUIREMENTS", "true").lower()
+    in ("1", "true", "yes", "on")
 )
 
 
-_REQUIRED_BOT_KEYS = {
-    "source",
-    "run",
-}
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+)
+
+LOG = logging.getLogger("multibots")
 
 
 # ---------------------------------------------------------------------------
-# LOGGING
-# ---------------------------------------------------------------------------
-
-def utc_now_iso() -> str:
-    return datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def setup_logging(
-    level: str = "INFO",
-    log_dir: Optional[str] = None,
-) -> logging.Logger:
-
-    root = logging.getLogger()
-
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
-
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)-7s "
-        "[%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    console = logging.StreamHandler(
-        stream=sys.stdout
-    )
-
-    console.setFormatter(formatter)
-    root.addHandler(console)
-
-    if log_dir:
-
-        try:
-
-            Path(log_dir).mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            from logging.handlers import RotatingFileHandler
-
-            file_handler = RotatingFileHandler(
-                Path(log_dir) / "multibots.log",
-                maxBytes=5 * 1024 * 1024,
-                backupCount=5,
-                encoding="utf-8",
-            )
-
-            file_handler.setFormatter(formatter)
-
-            root.addHandler(
-                file_handler
-            )
-
-        except Exception as exc:
-
-            logging.getLogger(
-                "multibots"
-            ).warning(
-                "File logging disabled: %s",
-                exc,
-            )
-
-    try:
-        root.setLevel(
-            level.upper()
-        )
-    except Exception:
-        root.setLevel(
-            logging.INFO
-        )
-
-    return logging.getLogger(
-        "multibots"
-    )
-
-
-# ---------------------------------------------------------------------------
-# BOT CONFIG
+# Bot configuration
 # ---------------------------------------------------------------------------
 
 @dataclass
 class BotConfig:
-
     name: str
     source: str
     run: str
-
-    env: Dict[str, str] = field(
-        default_factory=dict
-    )
+    env: Dict[str, str] = field(default_factory=dict)
 
     enabled: bool = True
+    python: str = sys.executable
+    args: List[str] = field(default_factory=list)
 
     max_restarts: Optional[int] = None
-
-    restart_delay_base: Optional[float] = None
-
-    health_url: str = ""
-
-    health_timeout: float = 5.0
+    restart_delay: Optional[float] = None
 
     cwd: Optional[str] = None
 
-    python: str = field(
-        default_factory=lambda: sys.executable
-    )
-
-    args: List[str] = field(
-        default_factory=list
-    )
-
-    timeout_graceful: float = 10.0
-
-    def resolve_cwd(
-        self,
-        bots_dir: str,
-    ) -> str:
-
+    def bot_dir(self) -> Path:
         if self.cwd:
+            path = Path(self.cwd)
 
-            if os.path.isabs(
-                self.cwd
-            ):
-                return self.cwd
+            if not path.is_absolute():
+                path = BOTS_DIR / path
 
-        return os.path.join(
-            bots_dir,
-            self.name,
-        )
+            return path
 
-    def resolve_runfile(
-        self,
-        bots_dir: str,
-    ) -> str:
+        return BOTS_DIR / self.name
 
-        return os.path.join(
-            self.resolve_cwd(
-                bots_dir
-            ),
-            self.run,
-        )
+    def run_file(self) -> Path:
+        return self.bot_dir() / self.run
 
 
 # ---------------------------------------------------------------------------
-# CONFIG LOADER
+# Config loader
 # ---------------------------------------------------------------------------
-
-class ConfigError(Exception):
-    pass
-
 
 class ConfigLoader:
 
-    def __init__(
-        self,
-        settings: Dict[str, Any],
-    ):
-        self.settings = settings
+    def __init__(self, path: Path):
+        self.path = path
 
-    def load(
-        self,
-        path: Optional[str] = None,
-    ) -> Tuple[
-        List[BotConfig],
-        Dict[str, Any]
-    ]:
+    def load(self) -> List[BotConfig]:
 
-        config_path = (
-            path
-            or self.settings[
-                "config_path"
-            ]
-        )
+        if not self.path.exists():
+            raise RuntimeError(
+                f"config.json not found: {self.path}"
+            )
 
         try:
-
-            with open(
-                config_path,
-                "r",
-                encoding="utf-8",
-            ) as file:
-
-                raw = json.load(
-                    file
-                )
-
-        except FileNotFoundError:
-
-            raise ConfigError(
-                f"Config file not found: "
-                f"{config_path}"
-            )
-
-        except json.JSONDecodeError as exc:
-
-            raise ConfigError(
-                f"Invalid JSON: {exc}"
-            )
-
-        if not isinstance(
-            raw,
-            dict,
-        ):
-            raise ConfigError(
-                "config.json must contain an object"
-            )
-
-        dashboard = raw.get(
-            "_dashboard",
-            {},
-        ) or {}
-
-        global_config = raw.get(
-            "_global",
-            {},
-        ) or {}
-
-        bots: List[BotConfig] = []
-
-        for name, entry in raw.items():
-
-            if name in _RESERVED_KEYS:
-                continue
-
-            try:
-
-                bot = self._validate_bot(
-                    name,
-                    entry,
-                    global_config,
-                )
-
-                bots.append(bot)
-
-            except ConfigError as exc:
-
-                logging.getLogger(
-                    "multibots"
-                ).error(
-                    "Skipping bot '%s': %s",
-                    name,
-                    exc,
-                )
-
-        return bots, dashboard
-
-    def _validate_bot(
-        self,
-        name: str,
-        entry: Any,
-        global_config: Dict[str, Any],
-    ) -> BotConfig:
-
-        if not isinstance(
-            entry,
-            dict,
-        ):
-            raise ConfigError(
-                "bot configuration must be an object"
-            )
-
-        if not _BOT_NAME_RE.match(
-            name
-        ):
-            raise ConfigError(
-                "invalid bot name"
-            )
-
-        missing = (
-            _REQUIRED_BOT_KEYS
-            - set(entry)
-        )
-
-        if missing:
-
-            raise ConfigError(
-                f"missing keys: "
-                f"{sorted(missing)}"
-            )
-
-        source = str(
-            entry["source"]
-        ).strip()
-
-        if not source:
-
-            raise ConfigError(
-                "source cannot be empty"
-            )
-
-        if not source.startswith(
-            (
-                "http://",
-                "https://",
-                "git@",
-                "ssh://",
-            )
-        ):
-
-            raise ConfigError(
-                "source must be a Git URL"
-            )
-
-        run = str(
-            entry["run"]
-        ).strip()
-
-        if not run:
-
-            raise ConfigError(
-                "run cannot be empty"
-            )
-
-        if (
-            os.path.isabs(run)
-            or "/" in run
-            or "\\" in run
-        ):
-
-            raise ConfigError(
-                "run must be a filename only"
-            )
-
-        env = entry.get(
-            "env",
-            {},
-        ) or {}
-
-        if not isinstance(
-            env,
-            dict,
-        ):
-
-            raise ConfigError(
-                "env must be an object"
-            )
-
-        env_values = {
-            str(key): str(value)
-            for key, value in env.items()
-        }
-
-        return BotConfig(
-
-            name=name,
-
-            source=source,
-
-            run=run,
-
-            env=env_values,
-
-            enabled=bool(
-                entry.get(
-                    "enabled",
-                    True,
-                )
-            ),
-
-            max_restarts=(
-                int(entry["max_restarts"])
-                if entry.get(
-                    "max_restarts"
-                ) is not None
-                else None
-            ),
-
-            restart_delay_base=(
-                float(
-                    entry[
-                        "restart_delay_base"
-                    ]
-                )
-                if entry.get(
-                    "restart_delay_base"
-                ) is not None
-                else None
-            ),
-
-            health_url=str(
-                entry.get(
-                    "health_url",
-                    "",
-                )
-            ),
-
-            health_timeout=float(
-                entry.get(
-                    "health_timeout",
-                    5.0,
-                )
-            ),
-
-            cwd=entry.get(
-                "cwd"
-            ),
-
-            python=str(
-                entry.get(
-                    "python",
-                    sys.executable,
-                )
-            ),
-
-            args=list(
-                entry.get(
-                    "args",
-                    [],
-                ) or []
-            ),
-
-            timeout_graceful=float(
-                entry.get(
-                    "timeout_graceful",
-                    10.0,
-                )
-            ),
-        )
-
-
-# ---------------------------------------------------------------------------
-# AUTOMATIC SOURCE DOWNLOADER
-# ---------------------------------------------------------------------------
-
-def prepare_bot_source(
-    cfg: BotConfig,
-    bots_dir: str,
-    log: logging.Logger,
-) -> bool:
-
-    target_dir = Path(
-        cfg.resolve_cwd(
-            bots_dir
-        )
-    )
-
-    git_dir = (
-        target_dir
-        / ".git"
-    )
-
-    try:
-
-        # ---------------------------------------------------------------
-        # Existing repository
-        # ---------------------------------------------------------------
-
-        if git_dir.is_dir():
-
-            log.info(
-                "Updating source for bot '%s' from %s",
-                cfg.name,
-                cfg.source,
-            )
-
-            result = subprocess.run(
-
-                [
-                    "git",
-                    "-C",
-                    str(target_dir),
-                    "pull",
-                    "--ff-only",
-                ],
-
-                stdout=subprocess.PIPE,
-
-                stderr=subprocess.STDOUT,
-
-                text=True,
-
-                timeout=180,
-            )
-
-            if result.returncode != 0:
-
-                log.error(
-                    "Git update failed for '%s': %s",
-                    cfg.name,
-                    result.stdout.strip(),
-                )
-
-                return False
-
-            log.info(
-                "Source for '%s' updated.",
-                cfg.name,
-            )
-
-        # ---------------------------------------------------------------
-        # Repository does not exist
-        # ---------------------------------------------------------------
-
-        else:
-
-            if target_dir.exists():
-
-                log.warning(
-                    "Removing old bot directory: %s",
-                    target_dir,
-                )
-
-                shutil.rmtree(
-                    target_dir
-                )
-
-            target_dir.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            log.info(
-                "Cloning bot '%s' from %s",
-                cfg.name,
-                cfg.source,
-            )
-
-            result = subprocess.run(
-
-                [
-                    "git",
-                    "clone",
-                    "--depth",
-                    "1",
-                    cfg.source,
-                    str(target_dir),
-                ],
-
-                stdout=subprocess.PIPE,
-
-                stderr=subprocess.STDOUT,
-
-                text=True,
-
-                timeout=300,
-            )
-
-            if result.returncode != 0:
-
-                log.error(
-                    "Git clone failed for '%s': %s",
-                    cfg.name,
-                    result.stdout.strip(),
-                )
-
-                return False
-
-            log.info(
-                "Bot '%s' source downloaded successfully.",
-                cfg.name,
-            )
-
-        # ---------------------------------------------------------------
-        # Install requirements
-        # ---------------------------------------------------------------
-
-        requirements = (
-            target_dir
-            / "requirements.txt"
-        )
-
-        if requirements.is_file():
-
-            log.info(
-                "Installing requirements for '%s'...",
-                cfg.name,
-            )
-
-            install = subprocess.run(
-
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "-r",
-                    str(requirements),
-                ],
-
-                stdout=subprocess.PIPE,
-
-                stderr=subprocess.STDOUT,
-
-                text=True,
-
-                timeout=600,
-            )
-
-            if install.returncode != 0:
-
-                log.error(
-                    "Requirements installation failed "
-                    "for '%s':\n%s",
-                    cfg.name,
-                    install.stdout[-5000:],
-                )
-
-                return False
-
-            log.info(
-                "Requirements installed for '%s'.",
-                cfg.name,
-            )
-
-        return True
-
-    except FileNotFoundError:
-
-        log.error(
-            "git was not found. "
-            "Make sure Git is installed."
-        )
-
-        return False
-
-    except subprocess.TimeoutExpired:
-
-        log.error(
-            "Timeout while preparing '%s'.",
-            cfg.name,
-        )
-
-        return False
-
-    except Exception as exc:
-
-        log.exception(
-            "Unexpected source preparation "
-            "error for '%s': %s",
-            cfg.name,
-            exc,
-        )
-
-        return False
-
-
-# ---------------------------------------------------------------------------
-# BOT STATE
-# ---------------------------------------------------------------------------
-
-@dataclass
-class BotState:
-
-    config: BotConfig
-
-    process: Optional[
-        subprocess.Popen
-    ] = None
-
-    pid: Optional[int] = None
-
-    status: str = "stopped"
-
-    started_at: Optional[
-        float
-    ] = None
-
-    last_exit_code: Optional[
-        int
-    ] = None
-
-    restart_count: int = 0
-
-    last_error: str = ""
-
-    cpu_percent: float = 0.0
-
-    memory_mb: float = 0.0
-
-    history: deque = field(
-        default_factory=lambda:
-        deque(maxlen=180)
-    )
-
-    def uptime_seconds(self) -> float:
-
-        if self.started_at is None:
-            return 0.0
-
-        return max(
-            0.0,
-            time.time()
-            - self.started_at,
-        )
-
-
-# ---------------------------------------------------------------------------
-# METRICS
-# ---------------------------------------------------------------------------
-
-class MetricsCollector(
-    threading.Thread
-):
-
-    POLL_INTERVAL = 5.0
-
-    def __init__(
-        self,
-        supervisor,
-        history_size: int = 180,
-    ):
-
-        super().__init__(
-            name="metrics",
-            daemon=True,
-        )
-
-        self.supervisor = supervisor
-
-        self.history_size = (
-            history_size
-        )
-
-        self._stop_event = (
-            threading.Event()
-        )
-
-    def run(self):
-
-        while not self._stop_event.is_set():
-
-            try:
-
-                for state in list(
-                    self.supervisor.states.values()
-                ):
-
-                    if (
-                        state.process
-                        and state.process.poll()
-                        is None
-                        and state.pid
-                    ):
-
-                        try:
-
-                            process = psutil.Process(
-                                state.pid
-                            )
-
-                            cpu = (
-                                process.cpu_percent(
-                                    interval=None
-                                )
-                            )
-
-                            memory = (
-                                process.memory_info()
-                                .rss
-                                / (
-                                    1024 * 1024
-                                )
-                            )
-
-                            state.cpu_percent = cpu
-
-                            state.memory_mb = memory
-
-                        except Exception:
-                            pass
-
-            except Exception:
-                pass
-
-            self._stop_event.wait(
-                self.POLL_INTERVAL
-            )
-
-    def stop(self):
-
-        self._stop_event.set()
-
-
-# ---------------------------------------------------------------------------
-# WEBHOOK
-# ---------------------------------------------------------------------------
-
-class WebhookNotifier:
-
-    def __init__(
-        self,
-        url: str,
-        timeout: float = 5.0,
-    ):
-
-        self.url = url
-
-        self.timeout = timeout
-
-        self.log = logging.getLogger(
-            "multibots.webhook"
-        )
-
-    def notify_crash(
-        self,
-        bot_name: str,
-        reason: str,
-    ):
-
-        if not self.url:
-            return
-
-        payload = {
-
-            "content":
-                f"⚠️ MultiBots: "
-                f"{bot_name} crashed — "
-                f"{reason}",
-
-            "bot_name":
-                bot_name,
-
-            "reason":
-                reason,
-
-            "timestamp":
-                utc_now_iso(),
-        }
-
-        try:
-
-            requests.post(
-                self.url,
-                json=payload,
-                timeout=self.timeout,
-            )
-
+            with self.path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
         except Exception as exc:
-
-            self.log.warning(
-                "Webhook failed: %s",
-                exc,
+            raise RuntimeError(
+                f"Cannot read config.json: {exc}"
             )
 
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "config.json must contain a JSON object"
+            )
 
-# ---------------------------------------------------------------------------
-# SUPERVISOR
-# ---------------------------------------------------------------------------
+        bots = []
 
-class BotSupervisor:
+        for name, raw in data.items():
 
-    def __init__(
-        self,
-        bots: List[BotConfig],
-        settings: Dict[str, Any],
-    ):
-
-        self.bots = {
-            bot.name: bot
-            for bot in bots
-        }
-
-        self.settings = settings
-
-        self.states = {
-
-            name:
-                BotState(
-                    config=cfg
-                )
-
-            for name, cfg
-            in self.bots.items()
-        }
-
-        self._lock = (
-            threading.RLock()
-        )
-
-        self._stop_event = (
-            threading.Event()
-        )
-
-        self._watchdog = None
-
-        self.log = logging.getLogger(
-            "multibots.supervisor"
-        )
-
-        self.notifier = None
-
-    # ------------------------------------------------------------------
-    # Start all bots
-    # ------------------------------------------------------------------
-
-    def start_all(self):
-
-        for name, cfg in self.bots.items():
-
-            if self._stop_event.is_set():
-                break
-
-            if not cfg.enabled:
-
-                self.states[
-                    name
-                ].status = "disabled"
-
+            if name.startswith("_"):
                 continue
 
-            self._start_one(
-                name
-            )
+            if not isinstance(raw, dict):
+                LOG.error(
+                    "Skipping '%s': configuration must be an object",
+                    name,
+                )
+                continue
 
-            time.sleep(
-                self.settings[
-                    "start_delay"
-                ]
-            )
+            source = str(raw.get("source", "")).strip()
+            run = str(raw.get("run", "")).strip()
 
-        self._start_watchdog()
+            if not source:
+                LOG.error(
+                    "Skipping '%s': source is missing",
+                    name,
+                )
+                continue
 
-    # ------------------------------------------------------------------
-    # Start one bot
-    # ------------------------------------------------------------------
+            if not run:
+                LOG.error(
+                    "Skipping '%s': run is missing",
+                    name,
+                )
+                continue
 
-    def _start_one(
-        self,
-        name: str,
-    ) -> bool:
+            env = raw.get("env", {}) or {}
 
-        state = self.states[
-            name
-        ]
+            if not isinstance(env, dict):
+                LOG.error(
+                    "Skipping '%s': env must be an object",
+                    name,
+                )
+                continue
 
-        cfg = self.bots[
-            name
-        ]
-
-        if (
-            state.process
-            and state.process.poll()
-            is None
-        ):
-
-            return True
-
-        # --------------------------------------------------------------
-        # DOWNLOAD SOURCE FIRST
-        # --------------------------------------------------------------
-
-        if not prepare_bot_source(
-
-            cfg,
-
-            self.settings[
-                "bots_dir"
-            ],
-
-            self.log,
-
-        ):
-
-            state.status = "crashed"
-
-            state.last_error = (
-                "source preparation failed"
-            )
-
-            self.log.error(
-                "Bot '%s' source preparation failed.",
-                name,
-            )
-
-            return False
-
-        # --------------------------------------------------------------
-        # Find main.py / run file
-        # --------------------------------------------------------------
-
-        bot_cwd = cfg.resolve_cwd(
-            self.settings[
-                "bots_dir"
-            ]
-        )
-
-        run_file = (
-            cfg.resolve_runfile(
-                self.settings[
-                    "bots_dir"
-                ]
-            )
-        )
-
-        if not os.path.isfile(
-            run_file
-        ):
-
-            state.status = "crashed"
-
-            state.last_error = (
-                f"run file not found: "
-                f"{run_file}"
-            )
-
-            self.log.error(
-                "Bot '%s' run file missing: %s",
-                name,
-                run_file,
-            )
-
-            return False
-
-        # --------------------------------------------------------------
-        # Environment
-        # --------------------------------------------------------------
-
-        env = os.environ.copy()
-
-        env.update(
-            {
-                str(key):
-                str(value)
-
-                for key, value
-                in cfg.env.items()
+            env = {
+                str(k): str(v)
+                for k, v in env.items()
             }
-        )
 
-        # --------------------------------------------------------------
-        # Start process
-        # --------------------------------------------------------------
-
-        argv = [
-            cfg.python,
-            cfg.run,
-        ]
-
-        argv.extend(
-            cfg.args
-        )
-
-        try:
-
-            state.status = "starting"
-
-            self.log.info(
-                "Starting bot '%s': %s",
-                name,
-                argv,
-            )
-
-            state.process = (
-                subprocess.Popen(
-
-                    argv,
-
-                    cwd=bot_cwd,
-
+            bots.append(
+                BotConfig(
+                    name=name,
+                    source=source,
+                    run=run,
                     env=env,
-
-                    stdout=subprocess.PIPE,
-
-                    stderr=subprocess.STDOUT,
-
-                    text=True,
-
-                    bufsize=1,
-                )
-            )
-
-            state.pid = (
-                state.process.pid
-            )
-
-            state.started_at = (
-                time.time()
-            )
-
-            state.status = "running"
-
-            state.last_error = ""
-
-            threading.Thread(
-
-                target=self._drain_logs,
-
-                args=(name,),
-
-                daemon=True,
-
-            ).start()
-
-            return True
-
-        except Exception as exc:
-
-            state.status = "crashed"
-
-            state.last_error = str(
-                exc
-            )
-
-            self.log.exception(
-                "Failed starting bot '%s'",
-                name,
-            )
-
-            return False
-
-    # ------------------------------------------------------------------
-    # Drain bot logs
-    # ------------------------------------------------------------------
-
-    def _drain_logs(
-        self,
-        name: str,
-    ):
-
-        state = self.states[
-            name
-        ]
-
-        process = state.process
-
-        if (
-            not process
-            or not process.stdout
-        ):
-            return
-
-        bot_logger = logging.getLogger(
-            f"multibots.bot.{name}"
-        )
-
-        try:
-
-            for line in iter(
-                process.stdout.readline,
-                "",
-            ):
-
-                line = line.rstrip()
-
-                if line:
-                    bot_logger.info(
-                        "%s",
-                        line,
-                    )
-
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Watchdog
-    # ------------------------------------------------------------------
-
-    def _start_watchdog(self):
-
-        if (
-            self._watchdog
-            and self._watchdog.is_alive()
-        ):
-            return
-
-        self._watchdog = threading.Thread(
-
-            target=self._watchdog_loop,
-
-            name="watchdog",
-
-            daemon=True,
-        )
-
-        self._watchdog.start()
-
-    def _watchdog_loop(self):
-
-        while not self._stop_event.is_set():
-
-            time.sleep(
-                self.settings[
-                    "watchdog_interval"
-                ]
-            )
-
-            for name, state in list(
-                self.states.items()
-            ):
-
-                if not state.process:
-                    continue
-
-                if (
-                    state.process.poll()
-                    is None
-                ):
-                    continue
-
-                if not self.bots[
-                    name
-                ].enabled:
-                    continue
-
-                state.status = "crashed"
-
-                state.last_exit_code = (
-                    state.process.returncode
-                )
-
-                state.last_error = (
-                    f"exited code="
-                    f"{state.last_exit_code}"
-                )
-
-                state.restart_count += 1
-
-                max_restarts = (
-                    self.bots[
-                        name
-                    ].max_restarts
-                )
-
-                if max_restarts is None:
-
-                    max_restarts = (
-                        self.settings[
-                            "max_restarts"
-                        ]
-                    )
-
-                if (
-                    state.restart_count
-                    > max_restarts
-                ):
-
-                    self.log.error(
-                        "Bot '%s' reached "
-                        "maximum restarts.",
-                        name,
-                    )
-
-                    continue
-
-                delay = min(
-
-                    self.settings[
-                        "restart_delay_base"
-                    ]
-                    * (
-                        2 ** (
-                            state.restart_count
-                            - 1
-                        )
+                    enabled=bool(
+                        raw.get("enabled", True)
                     ),
-
-                    self.settings[
-                        "restart_delay_max"
+                    python=str(
+                        raw.get("python", sys.executable)
+                    ),
+                    args=[
+                        str(x)
+                        for x in raw.get("args", [])
                     ],
-                )
-
-                self.log.warning(
-                    "Bot '%s' crashed. "
-                    "Restarting in %.1fs...",
-                    name,
-                    delay,
-                )
-
-                time.sleep(
-                    delay
-                )
-
-                self._start_one(
-                    name
-                )
-
-    # ------------------------------------------------------------------
-    # Stop one
-    # ------------------------------------------------------------------
-
-    def stop_one(
-        self,
-        name: str,
-    ):
-
-        state = self.states[
-            name
-        ]
-
-        process = state.process
-
-        if not process:
-            return
-
-        try:
-
-            process.terminate()
-
-            process.wait(
-                timeout=self.bots[
-                    name
-                ].timeout_graceful
-            )
-
-        except subprocess.TimeoutExpired:
-
-            try:
-                process.kill()
-            except Exception:
-                pass
-
-        except Exception:
-            pass
-
-        state.process = None
-        state.pid = None
-        state.status = "stopped"
-
-    # ------------------------------------------------------------------
-    # Stop all
-    # ------------------------------------------------------------------
-
-    def stop_all(self):
-
-        self._stop_event.set()
-
-        for name in list(
-            self.states.keys()
-        ):
-
-            self.stop_one(
-                name
-            )
-
-
-# ---------------------------------------------------------------------------
-# KEEP ALIVE
-# ---------------------------------------------------------------------------
-
-class KeepAlivePinger(
-    threading.Thread
-):
-
-    def __init__(
-        self,
-        url: str,
-        interval: float,
-    ):
-
-        super().__init__(
-            daemon=True
-        )
-
-        self.url = url
-
-        self.interval = interval
-
-        self.stop_event = (
-            threading.Event()
-        )
-
-    def run(self):
-
-        while not self.stop_event.is_set():
-
-            try:
-
-                requests.get(
-                    self.url,
-                    timeout=5,
-                )
-
-            except Exception:
-                pass
-
-            self.stop_event.wait(
-                self.interval
-            )
-
-    def stop(self):
-
-        self.stop_event.set()
-
-
-# ---------------------------------------------------------------------------
-# MAIN MULTIBOTS
-# ---------------------------------------------------------------------------
-
-class MultiBots:
-
-    def __init__(self):
-
-        self.settings = dict(
-            DEFAULTS
-        )
-
-        self.log = setup_logging(
-
-            self.settings[
-                "log_level"
-            ],
-
-            self.settings[
-                "log_dir"
-            ],
-        )
-
-        self.loader = ConfigLoader(
-            self.settings
-        )
-
-        self.bots = []
-
-        self.dashboard_cfg = {}
-
-        self.supervisor = None
-
-        self.metrics = None
-
-        self.pinger = None
-
-    def start(self):
-
-        self.bots, self.dashboard_cfg = (
-            self.loader.load()
-        )
-
-        self.log.info(
-            "Loaded %d bot(s) from %s",
-            len(self.bots),
-            self.settings[
-                "config_path"
-            ],
-        )
-
-        self.supervisor = (
-            BotSupervisor(
-                self.bots,
-                self.settings,
-            )
-        )
-
-        self.metrics = (
-            MetricsCollector(
-                self.supervisor,
-                self.settings[
-                    "metrics_history"
-                ],
-            )
-        )
-
-        self.pinger = (
-            KeepAlivePinger(
-                self.settings[
-                    "ping_url"
-                ],
-                self.settings[
-                    "ping_interval"
-                ],
-            )
-        )
-
-        self.metrics.start()
-
-        self.supervisor.start_all()
-
-        self.pinger.start()
-
-        self.log.info(
-            "MultiBots v%s started — "
-            "%d bot(s) supervised.",
-            __version__,
-            len(self.bots),
-        )
-
-    def stop(self):
-
-        if self.pinger:
-            self.pinger.stop()
-
-        if self.metrics:
-            self.metrics.stop()
-
-        if self.supervisor:
-            self.supervisor.stop_all()
-
-
-# ---------------------------------------------------------------------------
-# SIGNAL HANDLING
-# ---------------------------------------------------------------------------
-
-def install_signal_handlers(
-    app: MultiBots,
-):
-
-    def handler(
-        signum,
-        frame,
-    ):
-
-        logging.getLogger(
-            "multibots"
-        ).info(
-            "Received %s. Shutting down...",
-            signal.Signals(
-                signum
-            ).name,
-        )
-
-        try:
-            app.stop()
-        except Exception:
-            pass
-
-        sys.exit(0)
-
-    signal.signal(
-        signal.SIGTERM,
-        handler,
-    )
-
-    signal.signal(
-        signal.SIGINT,
-        handler,
-    )
-
-
-# ---------------------------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------------------------
-
-def main() -> int:
-
-    app = MultiBots()
-
-    install_signal_handlers(
-        app
-    )
-
-    app.start()
-
-    try:
-
-        while True:
-
-            time.sleep(
-                3600
-            )
-
-    except KeyboardInterrupt:
-
-        app.stop()
-
-    return 0
-
-
-if __name__ == "__main__":
-
-    sys.exit(
-        main()
-    )
+                    max_restarts=(
+                        int(raw["max_restarts"])
+                        if raw.get("max_restarts") is not None
+                        else None
+                    ),
+                    restart_delay=(
+                        float(raw["restart_delay"])
+                        if raw.get("restart_delay") is not None
