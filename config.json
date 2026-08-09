@@ -1,18 +1,7 @@
 {
-    "_dashboard": {
-        "password_hash": "pbkdf2_sha256$240000$fad7f3a5b7570fef88bb9b3d415d93d5$45584ac87eb827f541b13fe4d5398d1b5ad81a2bd8c95a8d37faa9dd686afc6d",
-        "session_secret": ""
-    },
-    "_global": {
-        "max_restarts": 5,
-        "restart_delay_base": 2.0
-    },
-    "Tepthon": {
-        "source": "https://github.com/abdalalem11/Tepthon.git",
-        "run": "main.py",
-        "env": {},
-        "enabled": true,
-        "max_restarts": 5,
-        "restart_delay_base": 2.0
-    }
+  "Tepthon": {
+    "source": "https://github.com/abdalalem11/Tepthon.git",
+    "env": {},
+    "run": "main.py"
+  }
 }
