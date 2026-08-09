@@ -1,8 +1,3 @@
-{
-  "Tepthon": {
-    "env": {
-      "TOKEN": ""
-    },
-    "run": "main.py"
-  }
-}
+git add config.json
+git commit -m "fix Tepthon source"
+git push
