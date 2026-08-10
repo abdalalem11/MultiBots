@@ -3,961 +3,519 @@ MultiBots Dashboard
 -------------------
 Dashboard compatible with main.py v4.0.0
 
-Uses:
-    - MultiBots.status()
-    - BotSupervisor
-    - ConfigLoader
-    - DEFAULTS
+Works with:
+    gunicorn dashboard:app
 
-No dependency on:
-    KeepAlivePinger
-    MetricsCollector
-    WebhookNotifier
-    utc_now_iso
+It starts the MultiBots supervisor in a background thread and
+provides HTTP endpoints for Render health checks and monitoring.
+
+Required:
+    Flask
+    gunicorn
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import os
+import threading
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
-from flask import Flask, jsonify, render_template_string
-
-from main import (
-    DEFAULTS,
-    BotSupervisor,
-    ConfigLoader,
-    MultiBots,
-    setup_logging,
-)
-
-
-__version__ = "4.0.0"
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-HOST = os.environ.get(
-    "DASHBOARD_HOST",
-    DEFAULTS.get("host", "0.0.0.0"),
-)
-
-PORT = int(
-    os.environ.get(
-        "PORT",
-        str(DEFAULTS.get("port", 10000)),
-    )
-)
+from flask import Flask, jsonify
 
 
 # ============================================================
 # APP
 # ============================================================
 
-app = Flask(__name__)
+app = Flask("multibots-dashboard")
 
-logger = setup_logging(
-    os.environ.get(
-        "MB_LOG_LEVEL",
-        "INFO",
-    )
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+LOG_LEVEL = os.environ.get(
+    "MB_LOG_LEVEL",
+    "INFO",
+).upper()
+
+logging.basicConfig(
+    level=getattr(
+        logging,
+        LOG_LEVEL,
+        logging.INFO,
+    ),
+    format=(
+        "%(asctime)s %(levelname)-7s "
+        "[%(name)s] %(message)s"
+    ),
 )
 
+logger = logging.getLogger("dashboard")
+
 
 # ============================================================
-# MULTIBOTS INSTANCE
+# MULTIBOTS IMPORT
 # ============================================================
 
-multibots: Optional[MultiBots] = None
+try:
+    from main import (
+        DEFAULTS,
+        MultiBots,
+    )
+
+except Exception as exc:
+    DEFAULTS = {}
+    MultiBots = None
+
+    logger.exception(
+        "Failed to import MultiBots from main.py: %s",
+        exc,
+    )
 
 
-def get_multibots() -> MultiBots:
-    global multibots
+# ============================================================
+# GLOBAL SUPERVISOR
+# ============================================================
 
-    if multibots is None:
-        multibots = MultiBots()
+multibots = None
 
-    return multibots
+supervisor_thread = None
+
+startup_error = None
+
+started = False
+
+startup_lock = threading.Lock()
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+def build_settings() -> Dict[str, Any]:
+    """
+    Build settings for MultiBots.
+
+    Environment variables are read by main.py's DEFAULTS,
+    but we also pass the important dashboard settings here
+    explicitly.
+    """
+
+    settings = {}
+
+    if isinstance(DEFAULTS, dict):
+        settings.update(DEFAULTS)
+
+    # Render provides PORT.
+    settings["port"] = int(
+        os.environ.get(
+            "PORT",
+            os.environ.get(
+                "MB_PORT",
+                str(settings.get("port", 10000)),
+            ),
+        )
+    )
+
+    settings["host"] = os.environ.get(
+        "MB_HOST",
+        settings.get(
+            "host",
+            "0.0.0.0",
+        ),
+    )
+
+    settings["bots_dir"] = os.environ.get(
+        "MB_BOTS_DIR",
+        settings.get(
+            "bots_dir",
+            "/tmp/bots",
+        ),
+    )
+
+    settings["config_path"] = os.environ.get(
+        "MB_CONFIG_PATH",
+        settings.get(
+            "config_path",
+            "config.json",
+        ),
+    )
+
+    settings["log_level"] = os.environ.get(
+        "MB_LOG_LEVEL",
+        settings.get(
+            "log_level",
+            "INFO",
+        ),
+    )
+
+    settings["start_delay"] = float(
+        os.environ.get(
+            "MB_START_DELAY",
+            settings.get(
+                "start_delay",
+                2,
+            ),
+        )
+    )
+
+    settings["max_restarts"] = int(
+        os.environ.get(
+            "MB_MAX_RESTARTS",
+            settings.get(
+                "max_restarts",
+                5,
+            ),
+        )
+    )
+
+    settings["restart_delay_base"] = float(
+        os.environ.get(
+            "MB_RESTART_DELAY_BASE",
+            settings.get(
+                "restart_delay_base",
+                5,
+            ),
+        )
+    )
+
+    settings["watchdog_interval"] = float(
+        os.environ.get(
+            "MB_WATCHDOG_INTERVAL",
+            settings.get(
+                "watchdog_interval",
+                10,
+            ),
+        )
+    )
+
+    settings["shutdown_timeout"] = float(
+        os.environ.get(
+            "MB_SHUTDOWN_TIMEOUT",
+            settings.get(
+                "shutdown_timeout",
+                15,
+            ),
+        )
+    )
+
+    install_requirements = os.environ.get(
+        "MB_INSTALL_REQUIREMENTS",
+    )
+
+    if install_requirements is not None:
+        settings["install_requirements"] = (
+            install_requirements.lower()
+            not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+        )
+
+    return settings
+
+
+# ============================================================
+# SUPERVISOR THREAD
+# ============================================================
+
+def supervisor_worker() -> None:
+    global startup_error
+
+    if MultiBots is None:
+        startup_error = (
+            "Could not import MultiBots from main.py"
+        )
+        return
+
+    try:
+        settings = build_settings()
+
+        logger.info(
+            "Starting MultiBots supervisor..."
+        )
+
+        logger.info(
+            "Config path: %s",
+            settings.get("config_path"),
+        )
+
+        logger.info(
+            "Bots directory: %s",
+            settings.get("bots_dir"),
+        )
+
+        global multibots
+
+        multibots = MultiBots(
+            settings=settings,
+        )
+
+        multibots.run()
+
+    except Exception as exc:
+        startup_error = str(exc)
+
+        logger.exception(
+            "MultiBots supervisor crashed"
+        )
+
+
+# ============================================================
+# START SUPERVISOR
+# ============================================================
+
+def start_supervisor() -> None:
+    global supervisor_thread
+    global started
+
+    with startup_lock:
+
+        if started:
+            return
+
+        started = True
+
+        supervisor_thread = threading.Thread(
+            target=supervisor_worker,
+            name="multibots-supervisor",
+            daemon=True,
+        )
+
+        supervisor_thread.start()
+
+        logger.info(
+            "MultiBots supervisor thread started"
+        )
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def get_bot_status() -> List[Dict[str, Any]]:
+def get_bot_status():
     """
-    Returns the current bot status using the exact
-    status() method provided by main.py.
+    Return current bot status.
+
+    Compatible with main.py:
+        MultiBots.status()
     """
 
+    if multibots is None:
+        return []
+
     try:
-        return get_multibots().status()
+        return multibots.status()
 
     except Exception as exc:
         logger.exception(
-            "Failed to read bot status: %s",
-            exc,
+            "Failed to read bot status"
         )
 
-        return []
-
-
-def get_configured_bots() -> List[Dict[str, Any]]:
-    """
-    Reads config.json and returns safe dashboard data.
-    """
-
-    try:
-
-        configs = ConfigLoader(
-            DEFAULTS
-        ).load()
-
-    except Exception as exc:
-
-        logger.exception(
-            "Failed to load config: %s",
-            exc,
-        )
-
-        return []
-
-    result = []
-
-    for config in configs:
-
-        result.append(
+        return [
             {
-                "name": config.name,
-                "source": config.source,
-                "run": config.run,
-                "enabled": config.enabled,
-                "cwd": config.cwd,
-                "python": config.python,
-                "args": config.args,
-                "max_restarts": config.max_restarts,
-                "restart_delay_base": (
-                    config.restart_delay_base
-                ),
+                "error": str(exc),
             }
-        )
-
-    return result
+        ]
 
 
-def get_bot_files(
-    bot_name: str,
-) -> List[str]:
-
-    bots_dir = Path(
-        DEFAULTS["bots_dir"]
+def supervisor_alive() -> bool:
+    return bool(
+        supervisor_thread
+        and supervisor_thread.is_alive()
     )
 
-    root = bots_dir / bot_name
-
-    if not root.exists():
-        return []
-
-    if not root.is_dir():
-        return []
-
-    ignored = {
-        ".git",
-        "__pycache__",
-        ".venv",
-        "venv",
-        "env",
-        "node_modules",
-    }
-
-    files = []
-
-    try:
-
-        for path in root.rglob("*"):
-
-            relative = path.relative_to(root)
-
-            if any(
-                part in ignored
-                for part in relative.parts
-            ):
-                continue
-
-            if path.is_file():
-                files.append(
-                    str(relative)
-                )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Failed to inspect %s: %s",
-            bot_name,
-            exc,
-        )
-
-    return sorted(files)
-
 
 # ============================================================
-# API
+# ROOT
 # ============================================================
 
-@app.get("/api")
-def api_index():
+@app.get("/")
+def index():
+    """
+    Main dashboard endpoint.
+    """
+
+    bots = get_bot_status()
+
+    alive = supervisor_alive()
 
     return jsonify(
         {
-            "service": "MultiBots Dashboard",
-            "version": __version__,
-            "status": "running",
-            "bots": get_bot_status(),
+            "service": "MultiBots",
+            "version": "4.0.0",
+            "status": (
+                "running"
+                if alive
+                else "starting"
+            ),
+            "supervisor_alive": alive,
+            "startup_error": startup_error,
+            "bot_count": len(bots),
+            "bots": bots,
+            "endpoints": {
+                "health": "/health",
+                "healthz": "/healthz",
+                "status": "/status",
+            },
         }
     )
 
 
-@app.get("/api/health")
-def api_health():
+# ============================================================
+# HEALTH
+# ============================================================
 
-    statuses = get_bot_status()
+@app.get("/health")
+def health():
+    """
+    Human/API health endpoint.
+    """
 
-    alive = [
-        bot
-        for bot in statuses
-        if bot.get("alive")
-    ]
+    bots = get_bot_status()
+
+    alive_bots = sum(
+        1
+        for bot in bots
+        if bot.get("alive") is True
+    )
 
     return jsonify(
         {
             "status": "ok",
             "service": "MultiBots",
-            "version": __version__,
-            "total": len(statuses),
-            "alive": len(alive),
-            "bots": statuses,
+            "supervisor_alive": supervisor_alive(),
+            "bots": {
+                "total": len(bots),
+                "alive": alive_bots,
+            },
         }
     )
 
 
-@app.get("/api/status")
-def api_status():
+# ============================================================
+# RENDER HEALTHCHECK
+# ============================================================
+
+@app.get("/healthz")
+def healthz():
+    """
+    Endpoint used by Docker HEALTHCHECK and Render.
+    """
+
+    if startup_error:
+        return jsonify(
+            {
+                "status": "error",
+                "error": startup_error,
+            }
+        ), 503
 
     return jsonify(
         {
-            "bots": get_bot_status(),
+            "status": "ok",
+        }
+    ), 200
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+@app.get("/status")
+def status():
+    """
+    Detailed supervisor and bot status.
+    """
+
+    bots = get_bot_status()
+
+    return jsonify(
+        {
+            "service": "MultiBots",
+            "version": "4.0.0",
+            "supervisor": {
+                "alive": supervisor_alive(),
+                "started": started,
+                "error": startup_error,
+            },
+            "bots": bots,
         }
     )
 
 
-@app.get("/api/config")
-def api_config():
+# ============================================================
+# PING
+# ============================================================
 
+@app.get("/ping")
+def ping():
     return jsonify(
         {
-            "bots": get_configured_bots(),
+            "status": "pong",
+            "service": "MultiBots",
         }
     )
 
 
-@app.get("/api/bots/<bot_name>/files")
-def api_bot_files(bot_name: str):
+# ============================================================
+# STARTUP
+# ============================================================
 
-    return jsonify(
-        {
-            "bot": bot_name,
-            "files": get_bot_files(
-                bot_name
+def initialize() -> None:
+    """
+    Start the supervisor exactly once.
+
+    Gunicorn can load this module in multiple workers.
+    Each worker gets its own process, so avoid starting
+    duplicate supervisors inside the same process.
+    """
+
+    start_supervisor()
+
+
+# ============================================================
+# INITIALIZE ON IMPORT
+# ============================================================
+
+initialize()
+
+
+# ============================================================
+# LOCAL DEVELOPMENT
+# ============================================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            os.environ.get(
+                "MB_PORT",
+                "10000",
             ),
-        }
+        )
     )
 
-
-# ============================================================
-# DASHBOARD HTML
-# ============================================================
-
-HTML = r"""
-<!DOCTYPE html>
-
-<html lang="ar" dir="rtl">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
-
-<title>MultiBots Dashboard</title>
-
-<style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    font-family:
-        Arial,
-        Tahoma,
-        sans-serif;
-
-    background:
-        #0b0f19;
-
-    color:
-        #ffffff;
-}
-
-.container {
-    width: min(
-        1200px,
-        calc(100% - 30px)
-    );
-
-    margin:
-        30px auto;
-}
-
-.header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-
-    gap: 20px;
-
-    margin-bottom: 25px;
-}
-
-.title {
-    font-size: 28px;
-    font-weight: 800;
-}
-
-.subtitle {
-    margin-top: 7px;
-    color: #8d96a8;
-    font-size: 14px;
-}
-
-.refresh {
-    border: 0;
-    padding: 12px 18px;
-    border-radius: 12px;
-
-    background: #1b2333;
-    color: white;
-
-    cursor: pointer;
-}
-
-.refresh:hover {
-    background: #263149;
-}
-
-.cards {
-    display: grid;
-
-    grid-template-columns:
-        repeat(
-            auto-fit,
-            minmax(
-                180px,
-                1fr
-            )
-        );
-
-    gap: 15px;
-
-    margin-bottom: 25px;
-}
-
-.card {
-    background: #121927;
-
-    border:
-        1px solid #202a3d;
-
-    border-radius: 18px;
-
-    padding: 20px;
-}
-
-.card-title {
-    color: #8d96a8;
-    font-size: 14px;
-}
-
-.card-value {
-    margin-top: 10px;
-
-    font-size: 30px;
-    font-weight: 800;
-}
-
-.table-wrapper {
-    overflow-x: auto;
-
-    background: #121927;
-
-    border:
-        1px solid #202a3d;
-
-    border-radius: 18px;
-}
-
-table {
-    width: 100%;
-    border-collapse: collapse;
-}
-
-th,
-td {
-    padding: 16px;
-
-    text-align: right;
-
-    border-bottom:
-        1px solid #202a3d;
-}
-
-th {
-    color: #8d96a8;
-    font-size: 13px;
-}
-
-td {
-    font-size: 14px;
-}
-
-.status {
-    display: inline-flex;
-
-    align-items: center;
-
-    gap: 7px;
-
-    padding:
-        6px 10px;
-
-    border-radius:
-        999px;
-
-    font-size: 12px;
-    font-weight: 700;
-}
-
-.online {
-    background: #123b2b;
-    color: #5ff0a5;
-}
-
-.offline {
-    background: #3c1820;
-    color: #ff7d91;
-}
-
-.disabled {
-    background: #302c16;
-    color: #e8d36d;
-}
-
-.dot {
-    width: 8px;
-    height: 8px;
-
-    border-radius: 50%;
-
-    background: currentColor;
-}
-
-.entry {
-    direction: ltr;
-
-    text-align: left;
-
-    font-family:
-        monospace;
-
-    color: #9fc4ff;
-}
-
-.footer {
-    margin-top: 20px;
-
-    color: #687286;
-
-    font-size: 12px;
-
-    text-align: center;
-}
-
-.empty {
-    padding: 35px;
-
-    text-align: center;
-
-    color: #8d96a8;
-}
-
-@media (max-width: 650px) {
-
-    .header {
-        align-items: stretch;
-        flex-direction: column;
-    }
-
-    .refresh {
-        width: 100%;
-    }
-
-    th,
-    td {
-        padding: 12px 10px;
-    }
-
-}
-
-</style>
-
-</head>
-
-
-<body>
-
-<div class="container">
-
-    <div class="header">
-
-        <div>
-
-            <div class="title">
-                MultiBots Dashboard
-            </div>
-
-            <div class="subtitle">
-                مراقبة البوتات وحالتها بشكل مباشر
-            </div>
-
-        </div>
-
-        <button
-            class="refresh"
-            onclick="loadData()"
-        >
-            تحديث
-        </button>
-
-    </div>
-
-
-    <div class="cards">
-
-        <div class="card">
-
-            <div class="card-title">
-                إجمالي البوتات
-            </div>
-
-            <div
-                class="card-value"
-                id="total"
-            >
-                -
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="card-title">
-                تعمل الآن
-            </div>
-
-            <div
-                class="card-value"
-                id="alive"
-            >
-                -
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="card-title">
-                متوقفة
-            </div>
-
-            <div
-                class="card-value"
-                id="offline"
-            >
-                -
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="card-title">
-                آخر تحديث
-            </div>
-
-            <div
-                class="card-value"
-                id="updated"
-                style="font-size:18px"
-            >
-                -
-            </div>
-
-        </div>
-
-    </div>
-
-
-    <div class="table-wrapper">
-
-        <table>
-
-            <thead>
-
-                <tr>
-
-                    <th>
-                        البوت
-                    </th>
-
-                    <th>
-                        الحالة
-                    </th>
-
-                    <th>
-                        PID
-                    </th>
-
-                    <th>
-                        مرات إعادة التشغيل
-                    </th>
-
-                    <th>
-                        Entry Point
-                    </th>
-
-                </tr>
-
-            </thead>
-
-            <tbody id="bots">
-
-                <tr>
-
-                    <td
-                        colspan="5"
-                        class="empty"
-                    >
-                        جاري التحميل...
-                    </td>
-
-                </tr>
-
-            </tbody>
-
-        </table>
-
-    </div>
-
-
-    <div class="footer">
-
-        MultiBots v{{ version }}
-
-    </div>
-
-</div>
-
-
-<script>
-
-function escapeHtml(value) {
-
-    if (value === null ||
-        value === undefined) {
-
-        return "";
-
-    }
-
-    return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
-
-}
-
-
-function statusHtml(bot) {
-
-    if (bot.alive) {
-
-        return `
-            <span class="status online">
-                <span class="dot"></span>
-                يعمل
-            </span>
-        `;
-
-    }
-
-    return `
-        <span class="status offline">
-            <span class="dot"></span>
-            متوقف
-        </span>
-    `;
-
-}
-
-
-function entryHtml(bot) {
-
-    const entry = bot.entrypoint;
-
-    if (!entry) {
-        return "-";
-    }
-
-    if (Array.isArray(entry)) {
-
-        return escapeHtml(
-            entry[0] +
-            ": " +
-            entry[1]
-        );
-
-    }
-
-    return escapeHtml(entry);
-
-}
-
-
-async function loadData() {
-
-    try {
-
-        const response =
-            await fetch(
-                "/api/status",
-                {
-                    cache: "no-store"
-                }
-            );
-
-        if (!response.ok) {
-            throw new Error(
-                "HTTP " +
-                response.status
-            );
-        }
-
-        const data =
-            await response.json();
-
-        const bots =
-            data.bots || [];
-
-
-        const alive =
-            bots.filter(
-                bot => bot.alive
-            ).length;
-
-
-        const offline =
-            bots.length -
-            alive;
-
-
-        document.getElementById(
-            "total"
-        ).textContent =
-            bots.length;
-
-
-        document.getElementById(
-            "alive"
-        ).textContent =
-            alive;
-
-
-        document.getElementById(
-            "offline"
-        ).textContent =
-            offline;
-
-
-        document.getElementById(
-            "updated"
-        ).textContent =
-            new Date()
-                .toLocaleTimeString(
-                    "ar-SA"
-                );
-
-
-        const tbody =
-            document.getElementById(
-                "bots"
-            );
-
-
-        if (!bots.length) {
-
-            tbody.innerHTML = `
-                <tr>
-                    <td
-                        colspan="5"
-                        class="empty"
-                    >
-                        لا توجد بوتات
-                    </td>
-                </tr>
-            `;
-
-            return;
-
-        }
-
-
-        tbody.innerHTML =
-            bots.map(
-                bot => `
-
-                    <tr>
-
-                        <td>
-                            <strong>
-                                ${escapeHtml(
-                                    bot.name
-                                )}
-                            </strong>
-                        </td>
-
-                        <td>
-                            ${statusHtml(bot)}
-                        </td>
-
-                        <td>
-                            ${escapeHtml(
-                                bot.pid ?? "-"
-                            )}
-                        </td>
-
-                        <td>
-                            ${escapeHtml(
-                                bot.restarts ?? 0
-                            )}
-                        </td>
-
-                        <td class="entry">
-                            ${entryHtml(bot)}
-                        </td>
-
-                    </tr>
-
-                `
-            ).join("");
-
-    } catch (error) {
-
-        console.error(error);
-
-        document.getElementById(
-            "bots"
-        ).innerHTML = `
-            <tr>
-                <td
-                    colspan="5"
-                    class="empty"
-                >
-                    تعذر الاتصال بالخادم
-                </td>
-            </tr>
-        `;
-
-    }
-
-}
-
-
-loadData();
-
-
-setInterval(
-    loadData,
-    5000
-);
-
-</script>
-
-</body>
-
-</html>
-"""
-
-
-# ============================================================
-# DASHBOARD ROUTE
-# ============================================================
-
-@app.get("/")
-def dashboard():
-
-    return render_template_string(
-        HTML,
-        version=__version__,
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main() -> None:
-
-    logger.info(
-        "Starting MultiBots Dashboard"
+    host = os.environ.get(
+        "MB_HOST",
+        "0.0.0.0",
     )
 
     logger.info(
-        "Dashboard listening on %s:%s",
-        HOST,
-        PORT,
+        "Starting development dashboard on %s:%s",
+        host,
+        port,
     )
 
     app.run(
-        host=HOST,
-        port=PORT,
+        host=host,
+        port=port,
         debug=False,
         use_reloader=False,
     )
-
-
-if __name__ == "__main__":
-    main()
