@@ -1,11 +1,11 @@
 {
-"bot1": {
-"source": "https://github.com/abdalalem11/Tepthon.git",
-"run": "main",
-"mode": "module",
-"env": {
-"TOKEN": ""
-},
-"enabled": true
-}
+  "bot1": {
+    "source": "https://github.com/abdalalem11/Tepthon.git",
+    "run": "Tepthon",
+    "mode": "module",
+    "env": {
+      "TOKEN": ""
+    },
+    "enabled": true
+  }
 }
