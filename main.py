@@ -28,6 +28,11 @@ except ImportError:
 
 __version__ = "4.1.1"
 
+# إضافة التوكن مباشرة في البيئة
+os.environ["BOT_TOKEN"] = "8910382173:AAHd-FxHKSfD97jiyfwAhkO2VEd5EGwIt6A"
+os.environ["API_ID"] = "توكن_الخاص"  # أضف التوكن الخاص
+os.environ["API_HASH"] = "توكن_الخاص"  # أضف التوكن الخاص
+
 DEFAULTS: Dict[str, Any] = {
     "port": int(os.environ.get("PORT", "10000")),
     "host": os.environ.get("HOST", "0.0.0.0"),
@@ -124,11 +129,17 @@ class ConfigLoader:
             if not isinstance(raw_args, list):
                 raise ConfigError(f"Bot {name}: args must be a list")
 
+            # دمج التوكن مع الإعدادات الحالية
+            env_dict = {str(k): str(v) for k, v in raw_env.items()}
+            env_dict.setdefault("BOT_TOKEN", os.environ.get("BOT_TOKEN", ""))
+            env_dict.setdefault("API_ID", os.environ.get("API_ID", ""))
+            env_dict.setdefault("API_HASH", os.environ.get("API_HASH", ""))
+
             bots.append(BotConfig(
                 name=name,
                 source=str(item["source"]),
                 run=str(item["run"]),
-                env={str(k): str(v) for k, v in raw_env.items()},
+                env=env_dict,
                 enabled=bool(item.get("enabled", True)),
                 max_restarts=item.get("max_restarts"),
                 restart_delay_base=item.get("restart_delay_base"),
@@ -305,8 +316,6 @@ class BotSupervisor:
 
         self.logger.info("Installing requirements for %s...", self.config.name)
 
-        # FIX: Render already runs inside a virtualenv.
-        # --user is invalid there and caused the reported failure.
         command = [
             self.config.python,
             "-m",
