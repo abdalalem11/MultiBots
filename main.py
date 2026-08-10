@@ -6,6 +6,15 @@ installs requirements, discovers the entry point,
 starts bots, supervises them, and exposes a small
 HTTP health server for Render.
 
+Fixes:
+- Supports projects where main.py uses relative imports.
+- Supports Tepthon/core -> core compatibility.
+- Supports nested Python packages.
+- Adds bot root and bots directory to PYTHONPATH.
+- Keeps stdout/stderr connected to Render logs.
+- Automatically restarts crashed bots.
+- Provides /, /health and /healthz endpoints.
+
 IMPORTANT:
 Keep bot tokens in environment variables, NOT in this file.
 """
@@ -35,7 +44,7 @@ except ImportError:
     jsonify = None
 
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 
 
 # ============================================================
@@ -550,6 +559,98 @@ class BotSupervisor:
         )
 
     # ========================================================
+    # COMPATIBILITY ALIASES
+    # ========================================================
+
+    def _create_compatibility_aliases(self) -> None:
+        """
+        Some Telegram bot repositories have this layout:
+
+            main.py
+            Tepthon/
+                core/
+                ...
+
+        while main.py imports:
+
+            from .core.helper import ...
+
+        In that case Python expects:
+
+            core/
+
+        next to main.py.
+
+        This method creates a symlink when possible.
+        If symlinks are unavailable, it copies the
+        directory as a fallback.
+        """
+
+        root = self.get_root()
+
+        aliases = {
+            "core": [
+                root / "Tepthon" / "core",
+            ],
+            "database": [
+                root / "Tepthon" / "database",
+            ],
+        }
+
+        for alias_name, candidates in aliases.items():
+
+            alias = root / alias_name
+
+            if alias.exists():
+                continue
+
+            source = None
+
+            for candidate in candidates:
+
+                if candidate.is_dir():
+                    source = candidate
+                    break
+
+            if source is None:
+                continue
+
+            try:
+
+                alias.symlink_to(
+                    source,
+                    target_is_directory=True,
+                )
+
+                self.logger.info(
+                    "Created package compatibility alias: %s -> %s",
+                    alias,
+                    source,
+                )
+
+            except Exception:
+
+                try:
+
+                    shutil.copytree(
+                        source,
+                        alias,
+                    )
+
+                    self.logger.info(
+                        "Copied package compatibility directory: %s -> %s",
+                        source,
+                        alias,
+                    )
+
+                except Exception:
+
+                    self.logger.exception(
+                        "Could not create compatibility alias %s",
+                        alias_name,
+                    )
+
+    # ========================================================
     # PREPARE PACKAGES
     # ========================================================
 
@@ -565,6 +666,10 @@ class BotSupervisor:
         )
 
         self._ensure_init_file(root)
+
+        # Fix repositories where main.py imports
+        # .core but core actually lives under Tepthon/core.
+        self._create_compatibility_aliases()
 
         for directory in root.rglob("*"):
 
@@ -623,7 +728,10 @@ class BotSupervisor:
                 r"(?m)^\s*from\s+\.+",
                 text,
             )
-            or "__package__" in text
+            or re.search(
+                r"(?m)^\s*import\s+\.+",
+                text,
+            )
         )
 
     # ========================================================
@@ -931,7 +1039,9 @@ class BotSupervisor:
 
         candidates.sort(
             key=lambda x: (
-                len(x[0].relative_to(root).parts),
+                len(
+                    x[0].relative_to(root).parts
+                ),
                 str(x[0]).lower(),
             )
         )
@@ -994,7 +1104,7 @@ class BotSupervisor:
                 shutil.rmtree(target)
 
             self.logger.info(
-                "Cloning %s...",
+                "[%s] cloning...",
                 self.config.name,
             )
 
@@ -1027,6 +1137,11 @@ class BotSupervisor:
                 src,
                 target,
             )
+
+        self.logger.info(
+            "[%s] source downloaded successfully",
+            self.config.name,
+        )
 
         self.print_tree()
 
@@ -1065,6 +1180,7 @@ class BotSupervisor:
             "-m",
             "pip",
             "install",
+            "--user",
             "-r",
             str(requirements),
         ]
@@ -1093,7 +1209,9 @@ class BotSupervisor:
 
         env.update(self.config.env)
 
-        bot_dir = str(cwd.resolve())
+        bot_dir = str(
+            cwd.resolve()
+        )
 
         bots_dir = str(
             Path(
@@ -1118,9 +1236,14 @@ class BotSupervisor:
             dict.fromkeys(paths)
         )
 
+        env["PYTHONUNBUFFERED"] = "1"
+
+        # Make Python include the user-site packages.
         env.setdefault(
-            "PYTHONUNBUFFERED",
-            "1",
+            "PYTHONUSERBASE",
+            str(
+                Path.home() / ".local"
+            ),
         )
 
         return env
@@ -1138,6 +1261,10 @@ class BotSupervisor:
             raise FileNotFoundError(
                 f"Bot directory not found: {cwd}"
             )
+
+        # Always prepare compatibility aliases
+        # immediately before starting.
+        self.prepare_python_packages()
 
         mode, entrypoint = self.discover_entrypoint()
 
@@ -1188,8 +1315,6 @@ class BotSupervisor:
             ),
         )
 
-        # IMPORTANT:
-        # stdout/stderr remain connected to Render logs.
         self.process = subprocess.Popen(
             command,
             cwd=str(cwd),
@@ -1274,7 +1399,10 @@ class BotSupervisor:
 
         try:
 
-            for path in root.rglob("*.py"):
+            for path in root.rglob("*"):
+
+                if not path.is_file():
+                    continue
 
                 relative = path.relative_to(root)
 
@@ -1297,10 +1425,10 @@ class BotSupervisor:
             return
 
         self.logger.error(
-            "Python files available:"
+            "Available files:"
         )
 
-        for file in sorted(files)[:200]:
+        for file in sorted(files)[:300]:
 
             self.logger.error(
                 "  %s",
@@ -1358,6 +1486,17 @@ class HealthServer:
             return jsonify(
                 {
                     "status": "ok",
+                    "bots": self.app.status(),
+                }
+            )
+
+        @flask_app.get("/healthz")
+        def healthz():
+
+            return jsonify(
+                {
+                    "status": "ok",
+                    "service": "MultiBots",
                     "bots": self.app.status(),
                 }
             )
@@ -1457,9 +1596,7 @@ class MultiBots:
 
     def run(self) -> None:
 
-        # Start Render health endpoint immediately.
-        # This prevents Render from waiting for bot
-        # dependency installation.
+        # Start health endpoint immediately.
         self.health.start()
 
         try:
