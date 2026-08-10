@@ -1,7 +1,0 @@
-{
-    "Tepthon": {
-        "source": "https://github.com/abdalalem11/Tepthon.git",
-        "env": {},
-        "run": "main.py"
-    }
-}
