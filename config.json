@@ -3,7 +3,9 @@
     "source": "https://github.com/abdalalem11/Tepthon.git",
     "run": "main.py",
     "env": {
-      "TOKEN": "8910382173:AAHd-FxHKSfD97jiyfwAhkO2VEd5EGwIt6A"
+      "TOKEN": "8910382173:AAHd-FxHKSfD97jiyfwAhkO2VEd5EGwIt6A",
+      "API_ID": "32419741",
+      "API_HASH": "3b646239045f6be4d40498726b00b414"
     },
     "enabled": true
   }
