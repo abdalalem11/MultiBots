@@ -1,7 +1,7 @@
 {
   "bot1": {
     "source": "https://github.com/abdalalem11/Tepthon.git",
-    "run": "Tepthon/__main__.py",
+    "run": "main.py",
     "env": {
       "TOKEN": "8910382173:AAHd-FxHKSfD97jiyfwAhkO2VEd5EGwIt6A"
     },
